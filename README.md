@@ -21,7 +21,7 @@ plus a few slightly more specialized modules:
  * matplotlib
  * xarray
  * pandas
- * netCDF
+ * netCDF4
  
 ### Installation
 
@@ -35,4 +35,8 @@ Python must be able to find the `stompy` subdirectory of the repository.  So on 
 
 At this point, you should be able to start python and successfully run `import stompy.grid.unstructured_grid`, for example.
 
+```
+   SB edit: future must be installed 
+   pip install future
+```
  

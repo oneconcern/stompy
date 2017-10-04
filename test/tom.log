@@ -1,0 +1,2 @@
+TOM log:
+../stompy/grid/tom.py -b data/dumbarton.shp -s data/scale-lines.shp -f 2.0
