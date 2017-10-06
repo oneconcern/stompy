@@ -55,7 +55,6 @@ try:
 except ImportError:
     pq = 'NO priority queue found!'
 
-
 class GridException(Exception):
     pass
 
