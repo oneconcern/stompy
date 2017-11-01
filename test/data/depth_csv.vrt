@@ -1,0 +1,7 @@
+<OGRVRTDataSource>
+    <OGRVRTLayer name="depth">
+        <SrcDataSource>depth.csv</SrcDataSource>
+        <GeometryType>wkbPoint</GeometryType>
+        <GeometryField encoding="PointFromColumns" x="Easting" y="Northing" z="Elevation"/>
+    </OGRVRTLayer>
+</OGRVRTDataSource>

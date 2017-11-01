@@ -1,0 +1,7 @@
+<OGRVRTDataSource>
+    <OGRVRTLayer name="TX_HUC_120701040403_UTM15">
+        <SrcDataSource>TX_HUC_120701040403_UTM15.csv</SrcDataSource>
+        <GeometryType>wkbPoint</GeometryType>
+        <GeometryField encoding="PointFromColumns" x="Easting" y="Northing" z="Elevation"/>
+    </OGRVRTLayer>
+</OGRVRTDataSource>

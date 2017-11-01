@@ -1,2 +1,2 @@
 TOM log:
-../stompy/grid/tom.py -b shp/TX_test_UTM15.shp -s shp/scale-lines_TX_v2.shp -g TX_scale1_uniform500.shp
+../stompy/grid/tom.py -b shp/TX_test_UTM15.shp -s shp/scale-lines_TX_v3.shp -a shp/telescoping_scale_v2.shp
