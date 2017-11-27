@@ -1,3 +1,5 @@
+import matplotlib
+matplotlib.use("Agg")
 from stompy.grid.convert_sun_to_dfm import convert_mesh_suntans_to_dfm
 from stompy.grid.tom import Tom
 from stompy.grid.tom import ExitException
