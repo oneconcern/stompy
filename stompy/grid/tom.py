@@ -192,13 +192,21 @@ class Tom(object):
             elif opt == '--rigid-interior':
                 self.slide_interior = 0
         
-        self.check_parameters()
-        
+        self.check_parameters()   
         log_fp = open('tom.log','wt')
         log_fp.write( "TOM log:\n")
         log_fp.write( " ".join(argv) )
         log_fp.close()
-        
+        self.run_helper()
+
+    def run_from_script(huc_12_path, scale_lines_path, telescoping_scale_path, output_path):
+        self.boundary_shp = huc_12_path
+        self.scale_shps.append(scale_lines_path)
+        self.tele_scale_shps.append(telescoping_scale_path)
+        self.output_shp.append(output_path)
+        self.run_helper()
+
+    def run_helper(self):
         if not self.resume_checkpoint_fn:
             bound_args = self.prepare_boundary()
             density_args = self.prepare_density()
