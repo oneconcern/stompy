@@ -64,6 +64,7 @@ class Tom(object):
     optimize = None
     interior_shps = None
     output_shp = None
+    output_path = "."
     slide_interior = 1
     scale_factor = 1.0
     scale_ratio_for_cutoff = 1.0
@@ -75,7 +76,7 @@ class Tom(object):
     boundary_poly_shp = "processed-boundary.shp"
     smoothed_poly_shp = "smoothed-shoreline.shp"
     linestring_join_tolerance = 1.0
-    scale_shp_field_name='scale'
+    scale_shp_field_name="SCALE"
     density_map = None
 
 
@@ -199,11 +200,13 @@ class Tom(object):
         log_fp.close()
         self.run_helper()
 
-    def run_from_script(huc_12_path, scale_lines_path, telescoping_scale_path, output_path):
+    def run_from_script(self, huc_12_path, scale_lines_path, telescoping_scale_path, output_path, t=1.1):
         self.boundary_shp = huc_12_path
         self.scale_shps.append(scale_lines_path)
         self.tele_scale_shps.append(telescoping_scale_path)
-        self.output_shp.append(output_path)
+        self.output_shp = os.path.join(output_path, "suntans.shp")
+        self.output_path = output_path
+        self.effective_tele_rate = t
         self.run_helper()
 
     def run_helper(self):
@@ -250,11 +253,10 @@ class Tom(object):
         else:
             starting_step = self.p.step
             self.create_grid()
-
-            if (not os.path.exists('final.pav')) or self.p.step > starting_step:
-                self.p.write_complete('final.pav')
-            if (not os.path.exists('final.pdf')) or self.p.step > starting_step:
-                self.plot_intermediate(fn='final.pdf',color_by_step=False)
+            if (not os.path.exists(os.path.join(self.output_path, 'final.pav'))) or self.p.step > starting_step:
+                self.p.write_complete(os.path.join(self.output_path,'final.pav'))
+            if (not os.path.exists(os.path.join(self.output_path,'final.pdf'))) or self.p.step > starting_step:
+                self.plot_intermediate(fn=os.path.join(self.output_path, 'final.pdf'),color_by_step=False)
 
             # write grid as shapefile
             if self.output_shp:
@@ -262,13 +264,13 @@ class Tom(object):
                 self.p.write_shp(self.output_shp,only_boundaries=0,overwrite=1)
                 # by reading the suntans grid output back in, we should get boundary edges
                 # marked as 1 - self.p probably doesn't have these markers
-                g = trigrid.TriGrid(suntans_path='.')
+                g = trigrid.TriGrid(suntans_path=self.output_path)
                 g.write_shp('trigrid_write.shp',only_boundaries=0,overwrite=1)
 
             if self.optimize:
                 self.run_optimization()
-                self.p.write_complete('post-optimize.pav')
-                self.plot_intermediate(fn='post-optimize.pdf')
+                self.p.write_complete(os.path.join(self.output_path,'post-optimize.pav'))
+                self.plot_intermediate(fn=os.path.join(self.output_path,'post-optimize.pdf'))
                 
     def check_parameters(self):
         """ make sure that the command line arguments are consistent and that
@@ -400,7 +402,6 @@ class Tom(object):
             
         if len(self.tele_scale_shps)>0:
             internal_tele_rate = 1+ (self.effective_tele_rate-1)/self.scale_factor
-            
             tele_density = field.ApolloniusField.read_shps(self.tele_scale_shps,
                                                            value_field=self.scale_shp_field_name,
                                                            r=internal_tele_rate,
@@ -456,7 +457,7 @@ class Tom(object):
             print("Renumbering:")
             p.renumber()
             print("Writing suntans output")
-            p.write_suntans('.')
+            p.write_suntans(self.output_path)
         except paver.FillFailed:
             print("Paver failed.")
             print("plotting the aftermath")
