@@ -30,6 +30,9 @@ class Diffuser(object):
         self.grid = grid
         self.init_grid_geometry()
 
+    class PointOutsideDomain(Exception):
+        pass
+    
     def set_dirichlet(self,value,cell=None,xy=None,on_duplicate='error'):
         if cell is None:
             cell = self.grid.point_to_cell(xy)
@@ -37,7 +40,7 @@ class Diffuser(object):
             xy = self.grid.cells_center()[cell]
 
         if cell is None:
-            raise Exception("no cell found for dirichlet BC")
+            raise self.PointOutsideDomain("no cell found for dirichlet BC (cell=%s  xy=%s)"%(cell,xy))
         if cell in self.forced_cells:
             if on_duplicate=='error':
                 raise Exception("Cell forced by multiple BCs")
@@ -165,10 +168,11 @@ class Diffuser(object):
         self.grid.edge_to_cells() # makes sure that edges['cells'] exists.
         
         for j in range(self.grid.Nedges()):
-            if self.grid.edges['cells'][j,1] < 0:
+            e = self.grid.edges[j]
+            ic1,ic2 = e['cells']
+            
+            if ic1<0 or ic2<0:
                 continue # boundary edge
-            else:
-                e = self.grid.edges[j]
                 
             flux_per_gradient=flux_per_gradient_j[j]
             
@@ -176,7 +180,6 @@ class Diffuser(object):
             #  Cdiff[ic1] -= flux_per_gradient / (An[ic1]*dzc) * (C[ic2] - C[ic1])
             #  Cdiff[ic2] += flux_per_gradient / (An[ic2]*dzc) * (C[ic2] - C[ic1])
             # Where Cdiff is row, C is col
-            ic1,ic2 = e['cells']
 
             if is_calc_c[ic1] and is_calc_c[ic2]:
                 mic2 = c_map[ic2]
@@ -275,7 +278,7 @@ class Diffuser(object):
 
     solve_method='direct'
     solve_tol=1e-6
-    def solve_linear_system(self,animate=True):
+    def solve_linear_system(self,animate=False):
         x0=self.initial_guess()
 
         if animate:

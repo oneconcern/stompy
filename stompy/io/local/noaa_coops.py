@@ -155,7 +155,12 @@ def coops_dataset_product(station,product,
                 # not all stations have NAVD, so fall back to MSL
                 params['datum']=datums[0] 
                 req=requests.get(base_url,params=params)
-                data=req.json()
+                try:
+                    data=req.json()
+                except ValueError: # thrown by json parsing
+                    log.warning("Likely server error retrieving JSON data from tidesandcurrents.noaa.gov")
+                    data=dict(error=dict(message="Likely server error"))
+                    break
                 if ('error' in data) and ("datum" in data['error']['message'].lower()):
                     # Actual message like 'The supported Datum values are: MHHW, MHW, MTL, MSL, MLW, MLLW, LWI, HWI'
                     log.info(data['error']['message'])
@@ -171,9 +176,13 @@ def coops_dataset_product(station,product,
             if "No data was found" in msg:
                 # station does not have this data for this time.
                 log.warning("No data found for this period")
-                continue
+            # Regardless, if there was an error we got no data.
+            continue
 
-        ds=coops_json_to_ds(data,params)    
+        ds=coops_json_to_ds(data,params)
+        if len(datasets)>0:
+            # avoid duplicates in case they overlap
+            ds=ds.isel(time=ds.time.values>datasets[-1].time.values[-1])
         datasets.append(ds)
 
     if len(datasets)==0:

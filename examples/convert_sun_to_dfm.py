@@ -1,3 +1,5 @@
+#!/usr/bin/env python
+
 """
 Read a suntans grid in the current directory and write a DFM grid, output_net.nc
 """

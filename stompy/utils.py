@@ -27,6 +27,7 @@ except ImportError:
 from collections import OrderedDict,Iterable
 import sys
 from scipy.interpolate import RectBivariateSpline,interp1d
+from scipy import optimize 
 from . import filters, harm_decomp
 import re
 
@@ -384,8 +385,13 @@ def fill_tidal_data(da,fill_time=True):
 
     # lowpass at about 5 days, splitting out low/high components
     winsize=int( np.timedelta64(5,'D') / dt )
-    data_lp=filters.lowpass_fir(data,winsize)
-    data_hp=data - data_lp
+    if winsize<len(data):
+        data_lp=filters.lowpass_fir(data,winsize)
+        data_hp=data - data_lp
+    else:
+        # not long enough, punt with the mean.
+        data_hp=data - data.mean()
+        data_lp=0*data
 
     valid=np.isfinite(data_hp)
     
@@ -465,7 +471,11 @@ def interp_near(x,sx,sy,max_dx=None):
 
     y_at_x=np.interp(x,sx,sy)
     # drop things off the end and things too spaced apart
-    y_at_x[ (dx>max_dx) | (dx<0) ] = np.nan                 
+    try:
+        y_at_x[ (dx>max_dx) | (dx<0) ] = np.nan
+    except TypeError: # so it was a scalar...
+        if (dx>max_dx) | (dx<0):
+            y_at_x=np.nan
     return y_at_x
 
 def nearest(A,x,max_dx=None):
@@ -713,7 +723,7 @@ def resample_to_common(A,Z,
 
 
 def principal_theta(vec,eta=None,positive='flood',detrend=False,
-                    ambiguous='warn'):
+                    ambiguous='warn',ignore_nan=True):
     """
     vec: 2D velocity data, last dimension must be {x,y} component.
     eta: if specified, freesurface data with same time dimension as vec.
@@ -722,10 +732,20 @@ def principal_theta(vec,eta=None,positive='flood',detrend=False,
       the assumption is that the tides are between standing and progressive,
       such that u*h and u*dh/dt are both positive for flood-positive u.
 
+    if positive is a number, it is taken as the preferential theta, and 
+      ambiguity will be resolved by choosing the angle close to positive
+
     ambiguous: 'warn','error','standing','progressive','nan' see code.
     """
     # vec just needs to have a last dimensions of 2.
     vec=vec.reshape([-1,2])
+
+    if ignore_nan:
+        valid=np.all(np.isfinite(vec),axis=1)
+    else:
+        valid=slice(None)
+    vec=vec[valid,:]
+    
     if detrend:
         vbar=vec.mean(axis=0)
         vec=vec-vbar[None,:]
@@ -733,6 +753,7 @@ def principal_theta(vec,eta=None,positive='flood',detrend=False,
 
     theta=np.arctan2( svdU[0,1],svdU[0,0] )
     if eta is not None:
+        eta=eta[valid] # not tested!
         unit=np.array( [np.cos(theta),np.sin(theta)] )
         U=np.dot(vec-vec.mean(axis=0),unit)
 
@@ -759,6 +780,15 @@ def principal_theta(vec,eta=None,positive='flood',detrend=False,
                 raise principal_theta.Exception("u_h: %f  u_dh: %f"%(u_h,u_dh))
             elif ambiguous=='nan':
                 return np.nan
+    else:
+        try: 
+            err=theta - positive # is it a number?
+        except TypeError:
+            err=0 # no flip
+        # circular error 
+        err = np.abs( (err + np.pi)%(2*np.pi) - np.pi )
+        if err>np.pi/2:
+            theta = (theta+np.pi) % (2*np.pi)
 
     return theta
 class PrincipalThetaException(Exception):
@@ -830,6 +860,66 @@ def model_skill(xmodel,xobs,ignore_nan=True):
     
     skill = 1 - num / den
     return skill
+
+
+def find_lag_xr(data,ref):
+    """ Report lag in time of data (xr.DataArray) with respect
+    to reference (xr.DataArray).  Requires that data and ref
+    are xr.DataArray, with coordinate values.
+    """
+    for arg in [data,ref]:
+        if not isinstance(arg,xr.DataArray):
+            raise Exception("Arguments to find_lag_xr must be DataArrays")
+
+    return find_lag( data[data.dims[0]].values, data.values,
+                     ref[ref.dims[0]].values, ref.values )
+
+def find_lag(t,x,t_ref,x_ref):
+    """
+    Report lag in time between x(t) and a reference x_ref(t_ref).
+
+    If times are already numeric, they are left as is and the lag is
+    reported in the same units.
+
+    If times are not numeric, they are converted to date nums via 
+    utils.to_dnum.  If they are np.datetime64, lag is reported as timedelta64.
+    If the inputs are datetimes, lag is reported as timedelta.
+    Otherwise, lag is kept as a floating point number
+    """
+    t_orig=t
+    # convert times if they aren't numeric: 
+    t=to_dnum(t)
+    t_ref=to_dnum(t_ref)
+
+    dt=np.median(np.diff(t))
+    dt_ref=np.median(np.diff(t_ref))
+
+    # goal is to interpolate the finer time scale onto the coarser.
+    # simplify code below by making sure that the reference is the 
+    # finer time scale
+    if dt<dt_ref:
+        lag_opt=-find_lag(t_ref,x_ref,t,x)
+    else:
+        def f(lag):
+            interp_x_ref=interp_near(t-lag,t_ref,x_ref,dt)
+            valid=np.isfinite(interp_x_ref * x)
+            R=np.corrcoef( interp_x_ref[valid],x[valid])[0,1]
+            return -R
+
+        # dt_ref here gives fmin a good guess on initial stepsize
+        lag_opt = optimize.fmin(f,dt_ref,disp=0)[0]
+
+    if isinstance(t_orig[0],datetime.datetime):
+        lag_opt = datetime.timedelta(days,lag_opt)
+    elif isinstance(t_orig[0],np.datetime64):
+        # goofy, but assume that lags are adequately represented 
+        # by 64 bits of microseconds.  That means the range of
+        # lags is +-1us to 2.9e5 years.  Good enough, unless you're a 
+        # a physicist or geologist.
+        lag_opt = np.timedelta64( int(lag_opt*86400*1e6), 'us')
+    return lag_opt
+
+
 
 def break_track(xy,waypoints,radius_min=400,radius_max=800,min_samples=10):
     """ 
@@ -1017,6 +1107,13 @@ def to_unix(t):
         dt0=datetime.datetime(1970, 1, 1)
         return (dt - dt0).total_seconds()
 
+def unix_to_dt64(t):
+    """
+    Convert a floating point unix timestamp to numpy datetime64 
+    """
+    unix0=np.datetime64('1970-01-01 00:00:00')
+    return unix0 + t*np.timedelta64(1,'s')
+    
 def cf_string_to_dt64(x):
     """ return a seconds-based numpy datetime 
     from something like 

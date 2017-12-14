@@ -456,6 +456,8 @@ class UnstructuredGrid(Listenable,undoer.OpHistory):
         ds[mesh_name].attrs['node_coordinates']='node_x node_y'
         ds[mesh_name].attrs['face_node_connectivity']='face_node'
         ds[mesh_name].attrs['edge_node_connectivity']='edge_node'
+        ds[mesh_name].attrs['face_dimension']='face'
+        ds[mesh_name].attrs['edge_dimension']='edge'
 
         ds['node_x']= ( ('node',),self.nodes['x'][:,0])
         ds['node_y']= ( ('node',),self.nodes['x'][:,1])
@@ -679,8 +681,11 @@ class UnstructuredGrid(Listenable,undoer.OpHistory):
     def renumber_nodes_ordering(self):
         return np.argsort(self.nodes['deleted'],kind='mergesort')
     
-    def renumber_nodes(self):
-        nsort =self.renumber_nodes_ordering()
+    def renumber_nodes(self,order=None):
+        if order is None:
+            nsort=self.renumber_nodes_ordering()
+        else:
+            nsort=order
         Nactive = np.sum(~self.nodes['deleted'])
 
         node_map = np.zeros(self.Nnodes()+1) # do this before truncating nodes
@@ -742,8 +747,11 @@ class UnstructuredGrid(Listenable,undoer.OpHistory):
         Nactive = sum(~self.cells['deleted'])
         return np.argsort( self.cells['deleted'],kind='mergesort')[:Nactive]
         
-    def renumber_cells(self):
-        csort = self.renumber_cells_ordering()
+    def renumber_cells(self,order=None):
+        if order is None:
+            csort = self.renumber_cells_ordering()
+        else:
+            csort= order
         Nneg=-min(-1,self.edges['cells'].min())
         cell_map = np.zeros(self.Ncells()+Nneg) # do this before truncating cells
         self.cells = self.cells[csort]
@@ -769,8 +777,12 @@ class UnstructuredGrid(Listenable,undoer.OpHistory):
         Nactive = sum(~self.edges['deleted'])
         return np.argsort( self.edges['deleted'],kind='mergesort')[:Nactive]
         
-    def renumber_edges(self):
-        esort = self.renumber_edges_ordering()
+    def renumber_edges(self,order=None):
+        if order is None:
+            esort=self.renumber_edges_ordering()
+        else:
+            esort=order
+            
         # edges take a little extra work, for handling -1 missing edges
         # Follows same logic as for cells
         Nneg=-min(-1,self.cells['edges'].min())
@@ -3307,33 +3319,13 @@ class UnstructuredGrid(Listenable,undoer.OpHistory):
         wkb2shp.wkb2shp(shpname,input_wkbs=cell_geoms,fields=cell_data,
                         overwrite=overwrite)
 
-    def write_shore_shp(self,shpname):
-        # this is a really bad implementation
-        # should probably infer relevant edges based on not having two 
-        # cell neighbors.
-        # and create the features directly through shapely.geometry, not
-        # via WKT.
-        new_ds, new_layer = self.init_shp(shpname,ogr.wkbLineString)
-        
-        fdef = new_layer.GetLayerDefn()
-
-        sides = self.edges_as_nodes_cells_mark()
-        vertices = self.nodes['x']
-        
-        boundaries = sides[np.where(sides[:,-1]>0)][:,:2]
-
-        for i in range(boundaries.shape[0]):
-            l = vertices[boundaries[i]]
-
-            feat = ogr.Feature(fdef)
-            wkt = """LINESTRING(%f %f, %f %f)"""%(l[0,0],l[0,1],l[1,0],l[1,1])
-            # print "Wkt is: ",wkt
-            
-            geom = ogr.CreateGeometryFromWkt(wkt)
-            feat.SetGeometryDirectly(geom)
-            new_layer.CreateFeature(feat)
-            
-        new_layer.SyncToDisk()
+    def write_shore_shp(self,shpname,geom_type='polygon'):
+        poly=self.boundary_polygon()
+        if geom_type=='polygon':
+            geoms=[poly]
+        elif geom_type=='linestring':
+            geoms=list(poly.boundary.geoms)
+        wkb2shp.wkb2shp(shpname,geoms)
 
     def init_shp(self,shpname,geom_type):
         drv = ogr.GetDriverByName('ESRI Shapefile')
@@ -3409,6 +3401,29 @@ class UnstructuredGrid(Listenable,undoer.OpHistory):
         wkb2shp.wkb2shp(shpname,input_wkbs=edge_geoms,fields=edge_data,
                         overwrite=True)
 
+    def write_node_shp(self,shpname,extra_fields=[]):
+        """ Write a shapefile with each node.  Fields will attempt to mirror
+        self.nodes.dtype
+
+        extra_fields: goal is similar to write_cells_shp and write_edges_shp, 
+        but not yet supported.
+        """
+        assert len(extra_fields)==0 # not yet supported!
+
+        # zero-based index of node (why does write_edge_shp create 1-based ids?)
+        base_dtype = [('node_id',np.int32)]
+
+        node_geoms=[geometry.Point( self.nodes['x'][i] )
+                    for i in self.valid_node_iter() ]
+
+        node_data=self.nodes[~self.nodes['deleted']].copy()
+
+        # don't need to write all of the original fields out:
+        node_data=utils.recarray_del_fields(node_data,['x','deleted'])
+
+        wkb2shp.wkb2shp(shpname,input_wkbs=node_geoms,fields=node_data,
+                        overwrite=True)
+        
     def write_ptm_gridfile(self,fn):
         """ write this grid out in the ptm grid format.
         """
