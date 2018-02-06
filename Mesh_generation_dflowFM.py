@@ -29,7 +29,7 @@ if __name__ == '__main__':
 
 	# Step 2: convert SUNTANS mesh to dfm mesh
 	
-	suntans_file_name = "TX_test2_net.nc"
+	suntans_file_name = "TX_test_Harris_net_rev2.nc"
 	#output_name = suntans_files_loc+"/"+suntans_file_name
 	output_name = suntans_file_name
 
@@ -47,7 +47,8 @@ if __name__ == '__main__':
 	g=dfm_grid.DFMGrid(output_name)
 	
 	# Load the bathy:
-	tiff_name = "shp/"+"TX_UTM15.tif"
+	# tiff_name = "shp/"+"TX_UTM15.tif"
+	tiff_name = "shp_harris/"+"TX_Harris_UTM15_rev2.tif"
 	dem=field.GdalGrid(tiff_name)
 
 	# dem.plot() # plot it just to make sure...
@@ -64,7 +65,7 @@ if __name__ == '__main__':
 	# or just g.nodes['depth']=depths if that field already exists.
 	
 	# Write back out
-	output_DEM_name = "TX_mesh_DEM_net.nc"
+	output_DEM_name = "TX_mesh_DEM_rev2_net.nc"
 	if os.path.exists(output_DEM_name):
 		os.remove(output_DEM_name)
 

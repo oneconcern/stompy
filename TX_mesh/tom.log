@@ -1,2 +1,2 @@
 TOM log:
-Mesh_generation_dflowFM.py -b shp/TX_test_UTM15.shp -a shp/telescoping_scale_v4.shp -g TX_use_telescoping_v8.shp -t 1.05
+Mesh_generation_dflowFM.py -b shp_harris/Area_mask_for_modeling.shp -a shp_harris/flowline_harris_UTM15_clip.shp -t 1.1
