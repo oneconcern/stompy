@@ -4,6 +4,8 @@ of this.  It's mostly a python translation of matlab code he
 provided. (this is a generalization of the code in tidal_filter.py)
 """
 
+from __future__ import print_function
+
 import numpy as np
 from scipy.signal.filter_design import butter
 import scipy.signal
@@ -37,29 +39,33 @@ def lowpass(data,in_t=None,cutoff=None,order=4,dt=None,axis=-1,causal=False):
 
 
 def lowpass_gotin(data,in_t_days,*args,**kwargs):
+    print("Use lowpass_godin() instead of lowpass_gotin()")
+    return lowpass_godin(data,in_t_days,*args,**kwargs)
+
+def lowpass_godin(data,in_t_days,*args,**kwargs):
     """ Approximate Gotin's tidal filter
     Note that in preserving the length of the dataset, the ends aren't really
     valid
     """
-    mean_dt_h = 24*mean(diff(in_t_days))
+    mean_dt_h = 24*np.mean(np.diff(in_t_days))
 
     # how many samples are in 24 hours?
-    N24 = round(24. / mean_dt_h)
+    N24 = int(round(24. / mean_dt_h))
     # and in 25 hours?
-    N25 = round(25. / mean_dt_h)
+    N25 = int(round(25. / mean_dt_h))
 
-    A24 = ones(N24) / float(N24)
-    A25 = ones(N25) / float(N25)
+    A24 = np.ones(N24) / float(N24)
+    A25 = np.ones(N25) / float(N25)
 
-    data = convolve(data,A24,'same')
-    data = convolve(data,A24,'same')
-    data = convolve(data,A25,'same')
+    data = np.convolve(data,A24,'same')
+    data = np.convolve(data,A24,'same')
+    data = np.convolve(data,A25,'same')
 
     return data
     
 
 def lowpass_fir(x,winsize,ignore_nan=True,axis=-1,mode='same',use_fft=False,
-                nan_weight_threshold=0.5):
+                nan_weight_threshold=0.49):
     """
     In the absence of exact filtering needs, choose the window 
     size to match the cutoff period.  Signals with a frequency corresponding to
@@ -77,6 +83,8 @@ def lowpass_fir(x,winsize,ignore_nan=True,axis=-1,mode='same',use_fft=False,
     mode: same as for scipy.signal convolve operations
     use_fft: using the fft is faster, but sometimes less robust
     nan_weight_threshold: items with a weight less than this will be marked nan
+      the default value is slightly less than half, to avoid numerical roundoff
+      issues with 0.49999999 < 0.5
     """
     # hanning windows have first/last elements==0.
     # but it's counter-intuitive - so force a window with nonzero
