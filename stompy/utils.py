@@ -45,11 +45,17 @@ def path(append):
         sys.path.append(append)
         
 def add_to(instance):
-    def decorator(f):
-        import types
-        f = types.MethodType(f, instance, instance.__class__)
-        setattr(instance, f.func_name, f)
-        return f
+    if six.PY2:
+        def decorator(f):
+            import types
+            f = types.MethodType(f, instance, instance.__class__)
+            setattr(instance, f.func_name, f)
+            return f
+    else:
+        def decorator(f):
+            f=f.__get__(instance,type(instance))
+            setattr(instance,f.__name__,f)
+            
     return decorator
 
 class Bucket(object):
@@ -521,6 +527,32 @@ def dist(a,b=None):
         a=a-b
     return mag(a)
 
+def haversine(a,b):
+    """
+    Calculate the great circle distance between two points
+    on the earth (specified in decimal degrees)
+
+    a,b: longitude/latitude in degrees.
+
+    Credit to ballsatballs.dotballs, 
+    https://stackoverflow.com/questions/29545704/fast-haversine-approximation-python-pandas
+
+    returns distance in km.
+    """
+    # to radians:
+    a=np.asanyarray(a)*np.pi/180.
+    b=np.asanyarray(b)*np.pi/180.
+
+    ab=b-a
+    dlon=ab[...,0]
+    dlat=ab[...,1]
+    #                               lat1                lat2
+    A = np.sin(dlat/2.0)**2 + np.cos(a[...,1]) * np.cos(b[...,1]) * np.sin(dlon/2.0)**2
+
+    C = 2 * np.arcsin(np.sqrt(A))
+    km = 6367 * C
+    return km
+
 
 def dist_along(x,y=None):
     if y is None:
@@ -543,17 +575,45 @@ def point_line_distance(point,line):
     delta -= np.dot(delta,vec) * vec
     return mag(delta)
 
+def point_segment_distance(point,seg,return_alpha=False):
+    """
+    Distance from point to finite segment
+    point: [nd] array
+    seg [2,nd] array
+    """
+    # find the point-line distance
+    delta = point - seg[0]
+    L=mag(seg[1]-seg[0])
+    vec = (seg[1] - seg[0])/L
+    alpha=np.dot(delta,vec) / L
+    if alpha<0:
+        D=dist(point,seg[0])
+    elif alpha>1:
+        D=dist(point,seg[1])
+    else:
+        delta -= np.dot(delta,vec) * vec
+        D=mag(delta)
+    if return_alpha:
+        return D,alpha
+    else:
+        return D
+
+
 # rotate the given vectors/points through the CCW angle in radians
 def rot_fn(angle):
     R = np.array( [[np.cos(angle),-np.sin(angle)],
                    [np.sin(angle),np.cos(angle)]] )
     def fn(pnts):
         pnts=np.asarray(pnts)
-        orig_shape=pnts.shape
         # could make the multi-dimensional side smarter...
-        pnts=pnts.reshape([-1,2])
-        pnts=np.tensordot(R,pnts,axes=(1,-1) ).transpose() 
-        pnts=pnts.reshape(orig_shape)
+        if pnts.ndim>1:
+            orig_shape=pnts.shape
+            pnts=pnts.reshape([-1,2])
+            pnts=np.tensordot(R,pnts,axes=(1,-1) ).transpose() 
+            pnts=pnts.reshape(orig_shape)
+        else:
+            # This isn't very tested...
+            pnts=np.dot(R,pnts)
         return pnts
     return fn
 
@@ -1043,7 +1103,7 @@ def to_dnum(x):
         if pd is not None and isinstance(x,pd.DataFrame) or isinstance(x,pd.Series):
             x=x.index.values
 
-        if np.issubdtype(x.dtype,np.float):
+        if np.issubdtype(x.dtype,np.floating): # used to be np.float, but that is deprecated
             return x
         if isinstance(x[0],datetime.datetime) or isinstance(x[0],datetime.date):
             return date2num(x)
@@ -1107,6 +1167,22 @@ def to_unix(t):
         dt0=datetime.datetime(1970, 1, 1)
         return (dt - dt0).total_seconds()
 
+<<<<<<< HEAD
+=======
+def to_jdate(t):
+    """
+    Convert a time-like scalar t to integer julian date, e.g. 2016291
+    (year and day of year concatenated)
+    The first of the year is 000, so add 1 if you want 2016-01-01 to be
+    2016001.
+    """
+    dt=to_datetime(t)
+    dt0=dt.replace(day=1,month=1,hour=0,minute=0,second=0)
+    doy=dt.toordinal() - dt0.toordinal()
+    return dt0.year * 1000 + doy
+    
+    
+>>>>>>> master
 def unix_to_dt64(t):
     """
     Convert a floating point unix timestamp to numpy datetime64 
@@ -1277,6 +1353,8 @@ def poly_circumcenter(points):
     """ 
     unbiased (mostly) estimate of circumcenter, by computing circumcenter
     of consecutive groups of 3 points
+    Similar to Janet, though Janet uses two sets of three while this code
+    uses all consecutive groups of three.
     """
     triples=np.array(list(circular_n(points,3)))
     ccs=circumcenter(triples[:,0],triples[:,1],triples[:,2])
@@ -1284,6 +1362,9 @@ def poly_circumcenter(points):
 
 def rms(v):
     return np.sqrt( np.mean( v**2 ) )
+
+def nanrms(v):
+    return np.sqrt( np.nanmean( v**2 ) )
 
 
 def circular_pairs(iterable):
@@ -1604,11 +1685,12 @@ def recarray_add_fields(A,new_fields):
     where data must be the same length as A.  So far, no support for
     non-scalar values
     """
+    hello=1
     new_dtype=A.dtype.descr
     for name,val in new_fields:
         # handle non-scalar fields
         # assume that the first dimension is the "record" dimension
-        new_dtype.append( (name,val.dtype,val.shape[1:] ) )
+        new_dtype.append( (str(name),val.dtype,val.shape[1:] ) )
     new_names=[name for name,val in new_fields]
     new_values=[val for name,val in new_fields]
     new_A=np.zeros( len(A), dtype=new_dtype)
@@ -1777,3 +1859,75 @@ def isolate_downcasts(ds,
             times_m[c] = times[s]
             xy_m[c,:] = xy[s]
     tr = Transect(xy=xy_m,times=times_m,elevations=z_mn.T,scalar=scalar_mn.T)
+
+def nan_cov(m,rowvar=1,demean=False):
+    """ 
+    covariance of the matrix, follows calling conventions of
+    numpy's cov function w.r.t. rows/columns
+    """
+    # not sure if cov() handles demeaning the same way
+    #if ~any(isnan(m)):
+    #    return cov(m,rowvar=rowvar)
+
+    
+    if rowvar:
+        m = np.transpose(m)
+
+    Ntimes,Nstations = m.shape
+
+    is_complex = (m.dtype.kind == 'c')
+
+    if is_complex:
+        c = np.nan*np.ones( (Nstations,Nstations), np.complex128 )
+    else:
+        c = np.nan*np.ones( (Nstations,Nstations), np.float64 )
+
+    # print("nan_cov: output shape is %s"%( str(c.shape) ))
+        
+    # precompute data that is per-station:
+    valids = ~np.isnan(m)
+    
+    if demean:
+        anoms = np.nan*np.ones_like( m )
+        
+        for station in range(Nstations):
+            vals = m[:,station]
+            anoms[:,station] = vals - np.mean(vals[valids[:,station]])
+    else:
+        anoms = m
+        
+    
+    for row in range(Nstations):
+        for col in range(row+1):
+            
+            v1_anom = anoms[:,row]
+            v2_anom = anoms[:,col]
+
+            # honestly it seems like it should be v2_anom
+            # that gets conjugated, but this gives more physical
+            # results and also agrees with matlabs implementation
+            if v1_anom.dtype.kind == 'c':
+                v1_anom = np.conj(v1_anom)
+            
+            valid = valids[:,row] & valids[:,col]
+            n_valid = valid.sum()
+
+            if n_valid <= 1:
+                c[row,col] = 0
+            else:
+                c[row,col] = 1.0/(valid.sum()-1.0) * (v1_anom*v2_anom)[valid].sum()
+
+            # Entirely possible that the whole matrix is wrong by a conjugate
+            # seems to be worked out now, if bit uneasy
+            if row!=col:
+                c[col,row] = np.conj(c[row,col])
+
+    return c
+
+def remove_repeated(A):
+    """
+    A: numpy 1D array
+    return A, without repeated element values.
+    """
+    return np.concatenate( ( A[:1], A[1:][ np.diff(A)!=0 ] ) )
+    

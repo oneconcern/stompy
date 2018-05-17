@@ -23,6 +23,26 @@ def distance_left_of_line(pnt, qp1, qp2):
     
     return (pnt[0] - qp1[0])*left_vec[0] + (pnt[1]-qp1[1])*left_vec[1]
 
+<<<<<<< HEAD
+=======
+def circ_to_gen(circ,repeat_start=False):
+    """
+    Given a CGAL circulator, loop once through it, yielding elements
+    as if it were an iterator.
+    
+    If repeat_start is True, the first item is returned at the end, too.
+    """
+    elt0=circ.next()
+    yield elt0
+    while True:
+        eltN=circ.next()
+        if eltN==elt0:
+            if repeat_start:
+                yield eltN
+            return
+        yield eltN
+        
+>>>>>>> master
 ## steppers for line_walk_edges_new
 def next_from_vertex(DT, vert, vec):
     # from a vertex, we either go into one of the faces, or along an edge
@@ -32,7 +52,13 @@ def next_from_vertex(DT, vert, vec):
     last_nbr = None
 
     start = None
+<<<<<<< HEAD
     for nbr in DT.incident_vertices(vert):
+=======
+    # we need to track the last and next, which is easiest by visiting
+    # the first neighbor twice, thanks to repeat_start=True
+    for nbr in circ_to_gen(DT.incident_vertices(vert),repeat_start=True):
+>>>>>>> master
         if DT.is_infinite(nbr):
             continue
         pnt = np.array( [nbr.point().x(),nbr.point().y()] )
@@ -67,7 +93,11 @@ def next_from_vertex(DT, vert, vec):
             if left_distance > 0:
                 # what is the face between the last one and this one??
                 # it's vertices are vert, nbr, last_nbr
+<<<<<<< HEAD
                 for face in DT.incident_faces(vert):
+=======
+                for face in circ_to_gen(DT.incident_faces(vert)):
+>>>>>>> master
                     for j in range(3):
                         if face.vertex(j) == nbr:
                             for k in range(3):
@@ -164,6 +194,7 @@ def delaunay_neighbors(self, n):
     """
     nbrs = []
 
+<<<<<<< HEAD
     # how do we stop on a circulator?
     first_v = None
     # somehow it fails HERE, with self.vh[n] being an int, rather
@@ -182,6 +213,16 @@ def delaunay_neighbors(self, n):
         # This is going to need something faster, or maybe the store info
         # bits of cgal.
         nbr_i = self.vh_info[v] #  np.where( self.vh == v )[0]
+=======
+    # how do we stop on a circulator? it's now handled in circ_to_gen()
+    for v in circ_to_gen(DT.incident_vertices(self.vh[n])):
+        if DT.is_infinite(v):
+            continue
+
+        # This is going to need something faster, or maybe the store info
+        # bits of cgal.
+        nbr_i = self.vh_info[v] 
+>>>>>>> master
         if nbr_i is None:
             print("    While looking for vertex at ",v.point())
             raise Exception("expected vertex handle->node, but instead got %s"%nbr_i)
@@ -240,7 +281,11 @@ def line_walk(DT,v1,v2,
 
             if next_item[0] == 'v':
                 # Find the edge connecting these two:
+<<<<<<< HEAD
                 for e in DT.incident_edges( next_item[1] ):
+=======
+                for e in circ_to_gen(DT.incident_edges( next_item[1] )):
+>>>>>>> master
                     f,v_opp = e
 
                     if f.vertex( (v_opp+1)%3 ) == hits[-1][1] or \

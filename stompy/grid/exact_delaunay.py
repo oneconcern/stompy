@@ -14,6 +14,11 @@ from ..spatial import robust_predicates
 from . import unstructured_grid
 from ..utils import circular_pairs
 
+if six.PY3:
+    def cmp(a,b):
+        return bool(a>b)-bool(a<b)
+
+
 try:
     from scipy import spatial
 except ImportError:
@@ -27,7 +32,11 @@ class BadConstraint(Exception):
 
 class IntersectingConstraints(BadConstraint):
     pass
-class ConstraintCollinearNode(BadConstraint):
+class ConstraintCollinearNode(IntersectingConstraints):
+    """
+    Special case of intersections, when a constraint attempts to 
+    run *through* an existing node
+    """
     pass
 
 def ordered(x1,x2,x3):

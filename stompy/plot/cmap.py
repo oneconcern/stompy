@@ -6,15 +6,11 @@ import numpy as np
 import colorsys
 import os,glob
 
-import ggr
 import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib import colors
 
-# these are the candidates for default in mpl1.5 / mpl2.0
-# viridis is the new default
-from mpl15 import magma,inferno,plasma,viridis
-
+from . import ggr
 
 def list_gradients():
     """ Return the locally available colormaps
@@ -71,13 +67,13 @@ def ggr_cm(filename,reverse=False):
 
     return colors.LinearSegmentedColormap.from_list(os.path.basename(filename),rgb_tuples)
 
-def cmap_transform(cmap,f):
+def cmap_transform(cmap,f,samples=256):
     """ brute-force - evaluate the gradient at all 256 locations.
     f is a function [0,1] => [0,1], mapping the new values to 
     old.
     e.g. f=lambda x: (1-x)  would reverse a colormap
     """
-    X = np.linspace(0,1,256)
+    X = np.linspace(0,1,samples)
     rgb_tuples = [ cmap(f(x)) for x in X]
     #rgb_tuples = [ (rgba,g,b) for rgba in rgb]
 
@@ -86,11 +82,32 @@ def cmap_transform(cmap,f):
 def cmap_reverse(cmap):
     return cmap_transform(cmap,lambda x: 1-x)
 
-inferno_r=cmap_transform(inferno,lambda x: (1-x))
-viridis_r=cmap_transform(viridis,lambda x: (1-x))
-plasma_r=cmap_transform(plasma,lambda x: (1-x))
-magma_r=cmap_transform(magma,lambda x: (1-x))
-      
+
+# these are the candidates for default in mpl1.5 / mpl2.0
+# viridis is the new default
+# Can probably deprecate this as most installations have mpl2.0 now.
+found_new_cmaps=False
+try:
+    from mpl15 import magma,inferno,plasma,viridis
+    inferno_r=cmap_transform(inferno,lambda x: (1-x))
+    viridis_r=cmap_transform(viridis,lambda x: (1-x))
+    plasma_r=cmap_transform(plasma,lambda x: (1-x))
+    magma_r=cmap_transform(magma,lambda x: (1-x))
+    found_new_cmaps=True
+except ImportError:
+    pass
+
+if not found_new_cmaps:
+    # new matplotlib has them built in:
+    try:
+        from matplotlib.cm import (viridis,magma,inferno,plasma,
+                                   viridis_r,magma_r,inferno_r,plasma_r)
+        found_new_cmaps
+    except ImportError:
+        # Just out of luck
+        pass 
+
+    
 def gmt_cm(filename,reverse=False):
     cpt = gmtColormap(filename,reverse=reverse)
     return colors.LinearSegmentedColormap(os.path.basename(filename), cpt)

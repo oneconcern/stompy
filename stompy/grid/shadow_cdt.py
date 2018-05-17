@@ -90,7 +90,11 @@ class ShadowCDT(exact_delaunay.Triangulation):
         self.remove_constraint(nodes[0],nodes[1])
 
     def delaunay_neighbors(self,gn):
+<<<<<<< HEAD
         n=self.nodemap_g_to_local(gn)
+=======
+        n=self.nodemap_g_to_local[gn]
+>>>>>>> master
         local_nbrs=self.node_to_nodes(n)
         return self.nodes['g_n'][local_nbrs]
         
@@ -130,7 +134,11 @@ class ShadowCGALCDT(object):
 
     def instrument_grid(self,g):
         vh=np.zeros( g.Nnodes(), dtype=object )
+<<<<<<< HEAD
         g.add_node_field('vh',vh)
+=======
+        g.add_node_field('vh',vh,on_exists='overwrite')
+>>>>>>> master
         
         g.subscribe_before('add_node',self.before_add_node)
         g.subscribe_after('add_node',self.after_add_node)
@@ -154,12 +162,20 @@ class ShadowCGALCDT(object):
         g.delete_node_field('vh')
 
     def init_from_grid(self,g):
+<<<<<<< HEAD
 
         for n in range(g.Nnodes()):
             if n % 50000==0:
                 log.info("init_from_grid: %d/%d"%(n,g.Nnodes()))
             # skip over deleted points:
             if ~g.nodes['delete'][n]:
+=======
+        for n in range(g.Nnodes()):
+            if n % 10000==0:
+                log.info("init_from_grid: %d/%d"%(n,g.Nnodes()))
+            # skip over deleted points:
+            if ~g.nodes['deleted'][n]:
+>>>>>>> master
                 self.dt_insert(n)
         
         # Edges:
@@ -355,9 +371,13 @@ class ShadowCGALCDT(object):
         # that gets through some early crashes.
         
         edges=[]
+<<<<<<< HEAD
         for e in circ:
             if edges and edges[0] == e:
                 break # come back to start of circulator
+=======
+        for e in cgal_line_walk.circ_to_gen(circ):
+>>>>>>> master
             if len(edges) > 10000:
                 assert False # probably a bad issue
             edges.append(e)
@@ -386,11 +406,25 @@ class ShadowCGALCDT(object):
         pass # no checks quite yet
     def after_add_node(self,g,func_name,return_value,**k):
         n=return_value
+<<<<<<< HEAD
         my_k={}
         # re: _index
         
         xy=k['x']
         pnt = Point_2( k['x'][0], k['x'][1] )
+=======
+        # re: _index
+        self.dt_insert(n)
+        
+    def dt_insert(self,n,x=None):
+        """
+        specify x to override the location, otherwise it comes from 
+        the grid.
+        """
+        if x is None:
+            x=self.g.nodes['x'][n]
+        pnt = Point_2( x[0], x[1] )
+>>>>>>> master
         assert self.g.nodes['vh'][n] in [0,None]
         vh = self.g.nodes['vh'][n] = self.DT.insert(pnt)
         self.vh_info[vh] = n
@@ -424,6 +458,10 @@ class ShadowCGALCDT(object):
         if len(to_remove) != len(g.node_to_edges(n)):
             # Usually means that there is an inconsistency in the CDT
             log.error("WARNING: modify_node len(DT constraints) != len(pnt2edges(i))")
+<<<<<<< HEAD
+=======
+            import pdb
+>>>>>>> master
             pdb.set_trace()
             
         # remove all of the constraints in one go:
@@ -439,7 +477,14 @@ class ShadowCGALCDT(object):
         # all constraints (instead of potentially creating new constraints,
         # and having to delete them and roll back)
 
+<<<<<<< HEAD
         self.after_add_node(g,'modify_node',n,**k)
+=======
+        # This throws away k['x']
+        # self.after_add_node(g,'modify_node',n,**k)
+        # This is clearer and keeps the right 'x'
+        self.dt_insert(n,k['x'])
+>>>>>>> master
 
         exc=None
         
@@ -496,10 +541,17 @@ class ShadowCGALCDT(object):
         nodes=g.edges['nodes'][j]
         self.remove_constraint(nodes[0],nodes[1])
         
+<<<<<<< HEAD
     def plot_dt(self):
         from matplotlib import pyplot,collections
 
         pyplot.clf()
+=======
+    def plot_dt(self,ax=None):
+        from matplotlib import pyplot,collections
+
+        # pyplot.clf()
+>>>>>>> master
 
         segs=[]
         csegs=[]
@@ -517,7 +569,11 @@ class ShadowCGALCDT(object):
             else:
                 segs.append(seg)
         ecoll=collections.LineCollection(segs)
+<<<<<<< HEAD
         ax=pyplot.gca()
+=======
+        ax=ax or pyplot.gca()
+>>>>>>> master
         ax.add_collection(ecoll)
         ccoll=collections.LineCollection(csegs,color='m')
         ax.add_collection(ccoll)

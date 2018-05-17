@@ -1,4 +1,8 @@
 import os
+<<<<<<< HEAD
+=======
+import copy
+>>>>>>> master
 import datetime
 import io # python io.
 import numpy as np
@@ -11,7 +15,6 @@ import logging
 
 log=logging.getLogger('delft.io')
 
-from . import waq_scenario as waq
 from ... import utils
 
 def parse_his_file(fn):
@@ -142,12 +145,12 @@ def mon_his_file_dataframe(fn):
     return df
 
 
-def inp_tok(fp):
+def inp_tok(fp,comment=';'):
     # tokenizer for parsing rules of delwaq inp file.
     # parses either single-quoted strings, or space-delimited literals.
     for line in fp:
-        if ';' in line:
-            line=line[ : line.index(';')]
+        if comment in line:
+            line=line[ : line.index(comment)]
         # pattern had been
         # r'\s*((\'[^\']+\')|([/:-a-zA-Z_#0-9\.]+))'
         # but that has a bad dash before a, and doesn't permit +, either.
@@ -156,6 +159,31 @@ def inp_tok(fp):
             yield m[0]
 
 
+def inp_tok_include(fp,fn,**kw):
+    """
+    Wrap inp_tok and handle INCLUDE tokens transparently.
+    Note that also requires the filename
+    """
+    tokr=inp_tok(fp,**kw)
+
+    while 1:
+        tok=next(tokr)
+        if tok.upper()!='INCLUDE':
+            yield tok
+        else:
+            inc_fn=next(tokr)
+            if inc_fn[0] in ["'",'"']:
+                inc_fn=inc_fn.strip(inc_fn[0])
+            inc_path=os.path.join( os.path.dirname(fn),
+                                   inc_fn )
+            # print("Will include %s"%inc_path)
+            
+            with open(inc_path,'rt') as inc_fp:
+                inc_tokr=inp_tok_include(inc_fp,inc_path,**kw)
+                for tok in inc_tokr:
+                    yield tok
+            # print("Done with include")
+            
             
 def parse_inp_monitor_locations(inp_file):
     """
@@ -248,8 +276,21 @@ def parse_time0(time0):
 # just a start.  And really this stuff should be rolled into the Scenario
 # class, so it builds up a Scenario
 def parse_boundary_conditions(inp_file):
+    """
+    Parse section 5 of DWAQ input file.
+    Returns bcs,items
+    bcs: BC links
+    items: match data and bc links.
+     - strings are folded to lowercase
+    
+    """
+    def dequote(s):
+        s=s.strip()
+        if s[0] in ['"',"'"]:
+            s=s.strip(s[0])
+        return s
     with open(inp_file,'rt') as fp:
-        tokr=inp_tok(fp)
+        tokr=inp_tok_include(fp,inp_file)
 
         while next(tokr)!='#4':
             continue
@@ -258,14 +299,72 @@ def parse_boundary_conditions(inp_file):
         while 1:
             tok = next(tokr)
             if tok[0] in "-0123456789":
-                n_thatcher = int(tok)
+                thatcher = int(tok)
                 break
             else:
-                bc_id=str_or_num
-                bc_typ=next(tokr)
-                bc_grp=next(tokr)
+                bc_id=dequote(tok)
+                bc_typ=dequote(next(tokr))
+                bc_grp=dequote(next(tokr))
                 bcs.append( (bc_id,bc_typ,bc_grp) )
 
+        if thatcher==0: # no lags
+            pass
+        else:
+            assert False,"Parsing Thatcher-Harleman lags not yet implemented"
+            
+        # The actual items are not yet implemented -- this is where
+        # the inp file would assign concentrations or fluxes to
+        # specific boundary exchanges are groups defined above
+        bc_items=[]
+
+        tok=next(tokr)
+        while 1: # iterate over BC blocks
+            defs=[]
+            while 1: # iterate over the 3 subparts of a block
+                if tok.upper()=='ITEM':
+                    # Read names of BC items, which could also be integers
+                    item_block=[]
+                    while 1:
+                        tok=next(tokr)
+                        if tok[0] in ["'",'"']:
+                            item_block.append(dequote(tok).lower())
+                            continue
+                        elif tok[0] in "0123456789":
+                            item_block.append(int(tok))
+                        else:
+                            break
+                    defs.append( ('item',item_block) )
+                elif tok.upper()=='CONCENTRATION':
+                    # Read the names of scalars
+                    # Read names of BC items, which could also be integers
+                    conc_block=[]
+                    while 1:
+                        tok=next(tokr)
+                        if tok.upper() not in ['DATA','ITEM']:
+                            conc_block.append(dequote(tok).lower())
+                            continue
+                        else:
+                            break
+                    defs.append( ('concentration',conc_block) )
+                elif tok.upper()=='DATA':
+                    matrix=np.zeros( ( len(defs[0][1]),
+                                       len(defs[1][1]) ), 'f8')
+                    for row_i,row in enumerate(defs[0][1]):
+                        for col_i,col in enumerate(defs[1][1]):
+                            matrix[row_i,col_i]=float(next(tokr))
+                    defs.append( ('data',matrix) )
+                    tok=next(tokr)
+                else:
+                    break # must not have been a BC block
+            if len(defs)==0:
+                assert tok=='#5'
+                break # great - not a block
+            elif len(defs)==3:
+                bc_items.append(defs)
+            else:
+                assert False,"Incomplete BC block"
+        
+    return bcs,bc_items
 
 def read_pli(fn,one_per_line=True):
     """
@@ -420,11 +519,15 @@ def read_map(fn,hyd,use_memmap=True,include_grid=True):
       this must be enabled.
 
     include_grid: the returned dataset also includes grid geometry, suitable
-       for unstructured_grid.from_ugrid(ds)
+       for unstructured_grid.from_ugrid(ds).  
+       WARNING: there is currently a bug which causes this grid to have errors.
+       probably a one-off error of some sort.
 
     note that missing values at this time are not handled - they'll remain as
     the delwaq standard -999.0.
     """
+    from . import waq_scenario as waq
+
     if not isinstance(hyd,waq.Hydro):
         hyd=waq.HydroFiles(hyd)
 
@@ -463,8 +566,8 @@ def read_map(fn,hyd,use_memmap=True,include_grid=True):
     framesize=(4+4*n_subs*n_segs)
     nframes,extra=divmod(bytes_left,framesize)
     if extra!=0:
-        log.warning("Reading map file %s: bad length %d extra bytes (or %d missing)"%(
-            fn,extra,framesize-extra))
+        log.warning("Reading map file %s: %d or %d frames? bad length %d extra bytes (or %d missing)"%(
+            fn,nframes,nframes+1,extra,framesize-extra))
 
     # Specify nframes in cases where the filesizes don't quite match up.
     mapped=np.memmap(fn,[ ('tsecs','i4'),
@@ -523,11 +626,21 @@ def map_add_z_coordinate(map_ds,total_depth='TotalDepth',coord_type='sigma',
     Makes an arbitrary assumption that the first output time step is roughly
     mean sea level.  Obviously wrong, but a starting point.
 
+<<<<<<< HEAD
+=======
+    Given the ordering of layers in dwaq output, the sigma coordinate created 
+    here is decreasing from 1 to 0.
+
+>>>>>>> master
     Modifies map_ds in place, also returning it.
     """
     assert coord_type=='sigma'
 
+<<<<<<< HEAD
     bedlevel=-map_ds.TotalDepth.isel(**{layer_dim:0,'time':0,'drop':True})
+=======
+    bedlevel=-map_ds[total_depth].isel(**{layer_dim:0,'time':0,'drop':True})
+>>>>>>> master
     dry=(bedlevel==999)
     bedlevel[dry]=0.0
     map_ds['bedlevel']=bedlevel
@@ -535,7 +648,11 @@ def map_add_z_coordinate(map_ds,total_depth='TotalDepth',coord_type='sigma',
     map_ds.bedlevel.attrs['positive']='up'
     map_ds.bedlevel.attrs['long_name']='Bed elevation relative to initial water level'
 
+<<<<<<< HEAD
     tdepth=map_ds.TotalDepth.isel(**{layer_dim:0,'drop':True})
+=======
+    tdepth=map_ds[total_depth].isel(**{layer_dim:0,'drop':True})
+>>>>>>> master
     eta=tdepth + map_ds.bedlevel
     eta.values[ tdepth.values==-999 ] = 0.0
     map_ds['eta']=eta
@@ -544,7 +661,13 @@ def map_add_z_coordinate(map_ds,total_depth='TotalDepth',coord_type='sigma',
     map_ds.eta.attrs['long_name']='Sea surface elevation relative initial time step'
 
     Nlayers=len(map_ds[layer_dim])
+<<<<<<< HEAD
     map_ds['sigma']=(layer_dim,), (0.5+np.arange(Nlayers)) / float(Nlayers)
+=======
+    # This is where sigma is made to be decreasing to capture the order of
+    # layers in DWAQ output.
+    map_ds['sigma']=(layer_dim,), (0.5+np.arange(Nlayers))[::-1] / float(Nlayers)
+>>>>>>> master
     map_ds.sigma.attrs['standard_name']="ocean_sigma_coordinate"
     map_ds.sigma.attrs['positive']='up'
     map_ds.sigma.attrs['units']=""
@@ -556,6 +679,13 @@ def dfm_wind_to_nc(wind_u_fn,wind_v_fn,nc_fn):
     """
     Transcribe DFM 'arcinfo' style gridded wind to
     CF compliant netcdf file (ready for import to erddap)
+
+    Note that the order of rows in the DFM format is weird, and
+    required bug fixes to this code 2017-12-21.  While dy is
+    specified positive, the rows of data are written from north to
+    south.  The DFM text file specifies coordinates for a llcorner
+    and a dy, but that llcorner corresponds to the first column of
+    the *last* row of data written out.  
 
     wind_u_fn:
       path to the amu file for eastward wind
@@ -580,7 +710,11 @@ def dfm_wind_to_nc(wind_u_fn,wind_v_fn,nc_fn):
                 if line.startswith('### END OF HEADER'):
                     break
                 continue # comment lines
-            key,value = line.split('=',2)
+            try:
+                key,value = line.split('=',2)
+            except ValueError:
+                print("Failed to split key=value for '%s'"%line)
+                raise
             key=key.strip()
             value=value.strip()
 
@@ -711,7 +845,8 @@ def dfm_wind_to_nc(wind_u_fn,wind_v_fn,nc_fn):
             assert count<expected
 
         block=np.concatenate( items ).reshape( header['n_rows'],header['n_cols'] )
-
+        # 2017-12-21: flip so that array index matches coordinate index.
+        block=block[::-1,:]
         time=utils.to_dt64(time_string)
         return time,block
 
@@ -737,7 +872,8 @@ def dfm_wind_to_nc(wind_u_fn,wind_v_fn,nc_fn):
 
 
 def dataset_to_dfm_wind(ds,period_start,period_stop,target_filename_base,
-                        extra_header=None,min_records=1):
+                        extra_header=None,min_records=1,
+                        wind_u='wind_u',wind_v='wind_v',pres='pres'):
     """
     Write wind in an xarray dataset to a pair of gridded meteo files for DFM.
 
@@ -746,7 +882,8 @@ def dataset_to_dfm_wind(ds,period_start,period_stop,target_filename_base,
       this dataset, already in the proper coordinates system, coordinates of x and 
       y, and the wind variables named wind_u and wind_v.
     period_start,period_stop: 
-      include data from the dataset on or after period_start, and up to period_stop.
+      include data from the dataset on or after period_start, and up to period_stop, 
+    inclusive
     target_filename_base:
       the path and filename for output, without the .amu and .amv extensions.
     extra_header: 
@@ -756,8 +893,11 @@ def dataset_to_dfm_wind(ds,period_start,period_stop,target_filename_base,
     returns the number of available records overlapping the requested period.
     If that number is less than min_records, no output is written.
     """
-    time_idx_start, time_idx_stop = np.searchsorted(ds.time,[period_start,period_stop])
-
+    
+    time_idx_start = np.searchsorted(ds.time,period_start,side='left')
+    # make stop inclusive by using side='right'
+    time_idx_stop  = np.searchsorted(ds.time,period_stop,side='right')
+    
     record_count=time_idx_stop-time_idx_start
     if record_count<min_records:
         return record_count
@@ -796,28 +936,42 @@ unit1 = m s-1
     fp_u=open(target_filename_base+".amu",'wt')
     fp_v=open(target_filename_base+".amv",'wt')
 
+    if pres in ds:
+        fp_p=open(target_filename_base+".amp",'wt')
+    else:
+        fp_p=None
+
     base_fields=dict(creator="stompy",nodata=nodata,
                      n_cols=len(ds.x),n_rows=len(ds.y),
                      dx=np.median(np.diff(ds.x)),
                      dy=np.median(np.diff(ds.y)),
                      x_llcorner=ds.x[0],
                      y_llcorner=ds.y[0],
-                     extra_header=extra_header,
-                     quantity='x_wind')
+                     extra_header=extra_header)
 
     for fp,quant in [ (fp_u,'x_wind'),
-                      (fp_v,'y_wind') ]:
+                      (fp_v,'y_wind'),
+                      (fp_p,'pres') ]:
+        if fp is None:
+            continue
         # Write the headers:
         fields=dict(quantity=quant)
         fields.update(base_fields)
         header=header_template%fields
         fp.write(header)
 
+    count=0
     for time_idx in range(time_idx_start, time_idx_stop):
+        count+=1
         if (time_idx-time_idx_start) % 96 == 0:
-            print("Written %d/%d time steps"%( time_idx-time_idx_start,time_idx_stop-time_idx_start))
-        u=ds.wind_u.isel(time=time_idx)
-        v=ds.wind_v.isel(time=time_idx)
+            log.info("Written %d/%d time steps"%( time_idx-time_idx_start,time_idx_stop-time_idx_start))
+        u=ds['wind_u'].isel(time=time_idx)
+        v=ds['wind_v'].isel(time=time_idx)
+        if pres in ds:
+            p=ds[pres].isel(time=time_idx)
+        else:
+            p=None
+            
         t=ds.time.isel(time=time_idx)
 
         # write a time line formatted like this:
@@ -825,15 +979,23 @@ unit1 = m s-1
         time_line="TIME=%f seconds since 1970-01-01 00:00:00 +00:00"%utils.to_unix(t.values)
 
         for fp,data in [ (fp_u,u),
-                         (fp_v,v) ]:
+                         (fp_v,v),
+                         (fp_p,p)]:
+            if fp is None:
+                continue
             # double check order.
             fp.write(time_line) ; fp.write("\n")
-            for row in data.values:
+            # 2017-12-21: flip order of rows to suit DFM convention
+            for row in data.values[::-1]:
                 fp.write(" ".join(["%g"%rowcol for rowcol in row]))
                 fp.write("\n")
 
+    log.info("Wrote %d time steps"%count)
+                
     fp_u.close()
     fp_v.close()
+    if fp_p is not None:
+        fp_p.close()
     return record_count
 
 class SectionedConfig(object):
@@ -848,15 +1010,30 @@ class SectionedConfig(object):
         filename: path to file to open and parse
         text: a string containing the entire file to parse
         """
-        self.sources=[] # maintain a list of strings identifying where values came from
+        # This isn't being used anywhere -- delete?  and below.
         self.rows=[]    # full text of each line
+        self.filename=filename
+        self.base_path=None
         
-        if filename is not None:
-            self.read(filename)
+        if self.filename is not None:
+            self.read(self.filename)
+            self.base_path=os.path.dirname(self.filename)
 
         if text is not None:
             fp = StringIO(text)
             self.read(fp,'text')
+
+    def set_filename(self,fn):
+        """
+        Updates self.filename and base_path, in anticipation of the file
+        being written to a new location (this is so new file paths can be
+        extrapolated before having to write this out)
+        """
+        self.filename=fn
+        self.base_path=os.path.dirname(self.filename)
+        
+    def copy(self):
+        return copy.deepcopy(self)
 
     def read(self, filename, label=None):
         if six.PY2:
@@ -872,7 +1049,8 @@ class SectionedConfig(object):
             fp = open(filename,'rt')
             label=label or filename
 
-        self.sources.append(label)
+        # This isn't being used anywhere -- delete?
+        # self.sources.append(label)
 
         for line in fp:
             # save original text so we can write out a new mdu with
@@ -890,6 +1068,8 @@ class SectionedConfig(object):
         brackets.
         value may be a string, or None.  Strings will be trimmed
         comment may be a string, or None.  It includes the leading comment character.
+        Indices are not stable across set_value(), since new entries may get inserted into
+        the middle of a section and shift other rows down.
         """
         section=None
         for idx,row in enumerate(self.rows):
@@ -905,7 +1085,7 @@ class SectionedConfig(object):
                 
     def parse_row(self,row):
         section_patt=r'^(\[[A-Za-z0-9 ]+\])([#;].*)?$'
-        value_patt = r'^([A-Za-z0-9_]+)\s*=([^#;]*)([#;].*)?$'
+        value_patt = r'^([A-Za-z0-9_ ]+)\s*=([^#;]*)([#;].*)?$'
         blank_patt = r'^\s*([#;].*)?$'
         
         m_sec = re.match(section_patt, row)
@@ -914,7 +1094,7 @@ class SectionedConfig(object):
 
         m_val = re.match(value_patt, row)
         if m_val is not None:
-            return m_val.group(1), m_val.group(2).strip(), m_val.group(3)
+            return m_val.group(1).strip(), m_val.group(2).strip(), m_val.group(3)
 
         m_cmt = re.match(blank_patt, row)
         if m_cmt is not None:
@@ -945,6 +1125,8 @@ class SectionedConfig(object):
         #   or a tuple of value and comment, without the leading comment character
         section='[%s]'%sec_key[0].lower()
         key=sec_key[1]
+
+        last_row_of_section={} # map [lower_section] to the index of the last entry in that section
         
         if isinstance(value,tuple):
             value,comment=value
@@ -953,22 +1135,37 @@ class SectionedConfig(object):
             comment=None
 
         value=self.val_to_str(value)
+
+        def fmt(key,value,comment):
+            return "%-18s= %-20s %s"%(key,value,comment or "")
         
         for row_idx,row_sec,row_key,row_value,row_comment in self.entries():
+            last_row_of_section[row_sec]=row_idx
+                
             if (row_key.lower() == key.lower()) and (section.lower() == row_sec.lower()):
-                comment = comment or row_comment or ""
-                self.rows[row_idx] = "%-18s= %-20s %s"%(row_key,value,comment)
+                self.rows[row_idx] = fmt(row_key,value,comment or row_comment)
                 return
 
-        # have to append it
-        if section!=row_sec:
+        row_text=fmt(key,value,comment)
+        if section in last_row_of_section:
+            # the section exists
+            last_idx=last_row_of_section[section]
+            self.rows.insert(last_idx+1,row_text)
+        else: # have to append the new section
             self.rows.append(section)
-        self.rows.append("%s = %s %s"%(row_key,value,comment or ""))
+            self.rows.append(row_text)
         
     def __setitem__(self,sec_key,value):
         self.set_value(sec_key,value)
     def __getitem__(self,sec_key): 
         return self.get_value(sec_key)
+    
+    def filepath(self,sec_key):
+        val=self.get_value(sec_key)
+        if self.base_path:
+            return os.path.join(self.base_path,val)
+        else:
+            return val
     
     def val_to_str(self,value):
         # make sure that floats are formatted with plenty of digits:
@@ -981,14 +1178,16 @@ class SectionedConfig(object):
         else:
             return str(value)
 
-    def write(self,filename):
+    def write(self,filename=None):
         """
-        Write this config out to a text file
+        Write this config out to a text file.
         filename: defaults to self.filename
         check_changed: if True, and the file already exists and is not materially different,
           then do nothing.  Good for avoiding unnecessary changes to mtimes.
         backup: if true, copy any existing file to <filename>.bak
         """
+        if filename is None:
+            filename=self.filename
         with open(filename,'wt') as fp:
             for line in self.rows:
                 fp.write(line)
@@ -1015,3 +1214,122 @@ class MDUFile(SectionedConfig):
         t_start = t_ref+int(self['time','tstart'])*tunit
         t_stop = t_ref+int(self['time','tstop'])*tunit
         return t_ref,t_start,t_stop
+<<<<<<< HEAD
+=======
+    def set_time_range(self,start,stop,ref_date=None):
+        if ref_date is not None:
+            # Make sure ref date is integer number of days
+            assert ref_date==ref_date.astype('M8[D]')
+        else:
+            # Default to truncating the start date
+            ref_date = start.astype('M8[D]')
+
+        self['time','RefDate'] = utils.to_datetime(ref_date).strftime('%Y%m%d')
+        self['time','Tunit'] = 'M' # minutes.  kind of weird, but stick with what was used already
+        self['time','TStart'] = int( (start - ref_date)/ np.timedelta64(1,'m') )
+        self['time','TStop'] = int( (stop - ref_date) / np.timedelta64(1,'m') )
+
+
+
+def exp_z_layers(mdu,zmin=None,zmax=None):
+    """
+    This will probably change, not very flexible now.
+    For singly exponential z-layers, return zslay, positive up, starting
+    from the bed.  first element is the bed itself.
+
+    zmin: deepest depth, positive up.  Defaults to ds.NetNode_z.min(),
+       read from the net file specified in mdu.
+    zmax: top of water column.  Defaults to WaterLevIni in mdu.
+    """
+
+    if zmax is None:
+        zmax=float(mdu['geometry','WaterLevIni'] )
+    if zmin is None:
+        ds=xr.open_dataset(mdu.filepath(['geometry','NetFile']))
+        zmin=float(ds.NetNode_z.min())
+        ds.close()
+        
+    kmx=int(mdu['geometry','kmx'])
+    coefs=[float(s) for s in mdu['geometry','StretchCoef'].split()] # 0.002 0.02 0.8
+
+    ztot=zmax-zmin
+
+    # From unstruc.F90:
+    dzslay=np.zeros(kmx,'f8')
+    zslay=np.zeros(kmx+1,'f8')
+
+    gfi = 1.0 / coefs[1] # this shouldn't do anything
+    gf  = coefs[2]
+    mx=kmx
+    k1=int( coefs[0]*kmx) 
+
+    gfk = gfi**k1
+
+    if gfk == 1.0:
+        gfi = 1.0
+        dzslay[0] = 1.0 / mx
+    else:
+        dzslay[0] = ( 1.0 - gfi ) / ( 1.0 - gfk )* coefs[0]
+
+    for k in range(1,k1):
+        dzslay[k] = dzslay[k-1] * gfi
+
+    gfk = gf**(kmx-k1)
+    if k1 < kmx:
+        if gfk == 1.0:
+            gf = 1.0
+            dzslay[k1] = 1.0 / mx
+        else:
+            dzslay[k1] = ( 1.0 - gf ) / ( 1.0 - gfk ) * ( 1.0 - coefs[0] )
+
+        for k in range(k1+1,mx):
+            dzslay[k] = dzslay[k-1] * gf
+
+    zslay[0] = zmin
+    for k in range(mx):
+        zslay[k+1] = zslay[k] + dzslay[k] * (zmax-zmin)
+
+
+    return zslay
+        
+
+def read_bnd(fn):
+    """
+    Parse DWAQ-style boundary data file
+    
+    Returns a list [ ['boundary_name',array([ boundary_link_idx,[[x0,y0],[x1,y1]] ])], ...]
+    """
+    with open(fn,'rt') as fp:
+        toker=inp_tok(fp)
+        token=lambda: six.next(toker)
+        
+        N_groups=int(token())
+        groups=[]
+        for group_idx in range(N_groups):
+            group_name=token()
+            N_link=int(token())
+            links=np.zeros( N_link,
+                            dtype=[ ('link','i4'),
+                                    ('x','f8',(2,2)) ] )
+            for i in range(N_link):
+                links['link'][i]=int(token())
+                links['x'][i,0,0]=float(token())
+                links['x'][i,0,1]=float(token())
+                links['x'][i,1,0]=float(token())
+                links['x'][i,1,1]=float(token())
+            groups.append( [group_name,links] )
+    return groups
+
+def write_bnd(bnd,fn):
+    with open(fn,'wt') as fp:
+        fp.write("%10d\n"%len(bnd))
+        for name,segs in bnd:
+            fp.write("%s\n"%name)
+            fp.write("%10d\n"%len(segs))
+            for seg in segs:
+                x=seg['x']
+                fp.write("%10d  %.7f  %.7f   %.7f  %.7f\n"%(seg['link'],
+                                                            x[0,0],x[0,1],x[1,0],x[1,1]))
+                
+
+>>>>>>> master
