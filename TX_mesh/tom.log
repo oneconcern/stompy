@@ -1,2 +1,2 @@
 TOM log:
-Mesh_generation_dflowFM.py -b shp_harris/Area_mask_for_modeling.shp -a shp_harris/flowline_harris_UTM15_clip.shp -t 1.1
+Mesh_generation_dflowFM.py -b shp_harris_v2/Area_mask_for_modeling.shp -a shp_harris_v2/buffer30_polyline.shp -t 1.1 -g TX_Harris_mesh_021418.shp -t 1.1

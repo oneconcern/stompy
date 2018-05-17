@@ -29,7 +29,7 @@ if __name__ == '__main__':
 
 	# Step 2: convert SUNTANS mesh to dfm mesh
 	
-	suntans_file_name = "TX_test_Harris_net_rev2.nc"
+	suntans_file_name = "TX_Harris_mesh_021418_SUNTANS_net.nc"
 	#output_name = suntans_files_loc+"/"+suntans_file_name
 	output_name = suntans_file_name
 
@@ -65,7 +65,7 @@ if __name__ == '__main__':
 	# or just g.nodes['depth']=depths if that field already exists.
 	
 	# Write back out
-	output_DEM_name = "TX_mesh_DEM_rev2_net.nc"
+	output_DEM_name = "TX_Harris_mesh_021418_net.nc"
 	if os.path.exists(output_DEM_name):
 		os.remove(output_DEM_name)
 

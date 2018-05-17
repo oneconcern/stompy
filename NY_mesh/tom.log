@@ -1,0 +1,2 @@
+TOM log:
+Mesh_generation_dflowFM_NY.py -b ../../../NY_demo/NY_domain_UTM18N.shp -a ../../../NY_demo/telescope_UTM18N.shp -t 1.1 -g NY_mesh_021918_20m.shp

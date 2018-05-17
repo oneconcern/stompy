@@ -245,8 +245,8 @@ class Tom(object):
 
             if (not os.path.exists('final.pav')) or self.p.step > starting_step:
                 self.p.write_complete('final.pav')
-            if (not os.path.exists('final.pdf')) or self.p.step > starting_step:
-                self.plot_intermediate(fn='final.pdf',color_by_step=False)
+            #if (not os.path.exists('final.pdf')) or self.p.step > starting_step:
+            #    self.plot_intermediate(fn='final.pdf',color_by_step=False)
 
             # write grid as shapefile
             if self.output_shp:
