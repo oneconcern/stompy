@@ -31,7 +31,9 @@ from stompy.model.delft import dfm_grid
 #map_output=xr.open_dataset('/mnt/TX_modeling_new/aws_modeling/aws_setup_0323/DFM_OUTPUT_FlowFM_Run5/FlowFM_map.nc')
 
 # NC modeling
-map_output=xr.open_dataset('/mnt/WORK/NC_modeling/linux_runs/test5_87pc/DFM_OUTPUT_FlowFM/FlowFM_map.nc')
+#map_output=xr.open_dataset('/mnt/WORK/NC_modeling/linux_runs/test5_87pc/DFM_OUTPUT_FlowFM/FlowFM_map.nc')
+#map_output=xr.open_dataset('/mnt/WORK/Validation/no35_TX_WSE_100pc/DFM_OUTPUT_FlowFM/FlowFM_map.nc')
+map_output=xr.open_dataset('/usr/src/WORK/AZ_modeling/linux_modeling/Tucson_7_100pc_fine_grid_2wk/DFM_OUTPUT_FlowFM/FlowFM_merged_map.nc')
 
 #map_output=xr.open_dataset('/media/psf/Home/WORK/sim02_br_removed_all_Q/DFM_OUTPUT_FlowFM/FlowFM_map.nc')
 g=dfm_grid.DFMGrid(map_output)
@@ -50,9 +52,15 @@ dep=map_output.mesh2d_waterdepth.isel(time=-1).values
 #dep0831=map_output.mesh2d_waterdepth.isel(time=41).values
 
 # when the output's 41st output is 8/31/2017
-wse1013=map_output.mesh2d_s1.isel(time=49).values
-dep1013=map_output.mesh2d_waterdepth.isel(time=49).values
+#wse1013=map_output.mesh2d_s1.isel(time=4).values
+#dep1013=map_output.mesh2d_waterdepth.isel(time=4).values
 
+# when the output's 56th output is 8/31/2017
+wse0530=map_output.mesh2d_s1.isel(time=1).values
+dep0530=map_output.mesh2d_waterdepth.isel(time=1).values
+
+#wse1013=map_output.mesh2d_s1.isel(time=3).values
+#dep1013=map_output.mesh2d_waterdepth.isel(time=3).values
 # Get max water depth overall time steps:
 wse_max=map_output.mesh2d_s1.max(dim='time').values
 dep_max=map_output.mesh2d_waterdepth.max(dim='time').values
@@ -80,6 +88,6 @@ dep_max=map_output.mesh2d_waterdepth.max(dim='time').values
 #    [('wse',wse),('wse0831',wse0831),('wse_max',wse_max),('depth',dep),('depth0831',dep0831),('depth_max',dep_max)])
 
 # NC modeling
-g.write_cells_shp('/mnt/WORK/output_shp_dflow/NC/NC_output.shp',extra_fields=  \
-    [('wse',wse),('wse1013',wse1013),('wse_max',wse_max),('depth',dep),('depth1013',dep1013),('depth_max',dep_max)])
+g.write_cells_shp('/usr/src/WORK/output_shp_dflow/AZ/AZ_tucson7.shp',extra_fields=  \
+    [('wse',wse),('wse0530',wse0530),('wse_max',wse_max),('depth',dep),('depth0530',dep0530),('depth_max',dep_max)])
 
