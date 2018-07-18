@@ -416,26 +416,28 @@ class Tom(object):
         return {'density':density}
 
     def plot_intermediate(self,fn=None,color_by_step=True):
-        fig = pylab.figure(figsize=(100,100))
-        ax = pylab.axes( [0,0,1,1] )
+        try:
+            fig = pylab.figure(figsize=(100,100))
+            ax = pylab.axes( [0,0,1,1] )
 
-        # In larger domains, this tends to become blocky when written out to PDF
-        # (maybe some sort of level-of-detail thing?)
-        # better to skip it - we still have the boundary plotted below
+            # In larger domains, this tends to become blocky when written out to PDF
+            # (maybe some sort of level-of-detail thing?)
+            # better to skip it - we still have the boundary plotted below
 
-        coll=self.p.plot() # plots edges, colored by age
-        if not color_by_step:
-            coll.set_array(None)
-            coll.set_edgecolor('k')
+            coll=self.p.plot() # plots edges, colored by age
+            if not color_by_step:
+                coll.set_array(None)
+                coll.set_edgecolor('k')
 
-        pylab.axis('equal')
-        if fn is None:
-            fn = self.plot_fn%self.p.__dict__
-            
-        pylab.savefig("temp-plot.pdf")
-        os.rename("temp-plot.pdf",fn)
-        pylab.close(fig)
-
+            pylab.axis('equal')
+            if fn is None:
+                fn = self.plot_fn%self.p.__dict__
+                
+            pylab.savefig("temp-plot.pdf")
+            os.rename("temp-plot.pdf",fn)
+            pylab.close(fig)
+        except:
+            print("Warning: Mesh generation plotting failed, output files will not include plot.")
     def create_grid(self):
         print("Starting grid generation")
 
