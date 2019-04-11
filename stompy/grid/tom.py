@@ -86,6 +86,7 @@ class Tom(object):
     def __init__(self):
         self.scale_shps = []
         self.tele_scale_shps = []
+        self.interior_shps = []
 
     def usage(self):
         print("tom.py   -h                   # show this help message      ")
@@ -204,7 +205,7 @@ class Tom(object):
         self.boundary_shp = huc_12_path
         self.scale_shps.append(scale_lines_path)
         self.tele_scale_shps.append(telescoping_scale_path)
-        self.interior_shps = breakline_path
+        self.interior_shps.append(breakline_path)
         self.output_shp = os.path.join(output_path, "suntans.shp")
         self.output_path = output_path
         self.effective_tele_rate = t
