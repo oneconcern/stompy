@@ -200,10 +200,11 @@ class Tom(object):
         log_fp.close()
         self.run_helper()
 
-    def run_from_script(self, huc_12_path, scale_lines_path, telescoping_scale_path, output_path, t=1.1):
+    def run_from_script(self, huc_12_path, scale_lines_path, telescoping_scale_path, breakline_path, output_path, t=1.1):
         self.boundary_shp = huc_12_path
         self.scale_shps.append(scale_lines_path)
         self.tele_scale_shps.append(telescoping_scale_path)
+        self.interior_shps = breakline_path
         self.output_shp = os.path.join(output_path, "suntans.shp")
         self.output_path = output_path
         self.effective_tele_rate = t
