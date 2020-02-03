@@ -20,6 +20,8 @@ def interp_to_time_per_ll(df,tstamp,lat_col='latitude',lon_col='longitude',
     interpolate each unique src/station to the given
     tstamp, and include a time_offset
     """
+    assert np.all(np.isfinite(df[value_col].values))
+    
     tstamp=utils.to_dnum(tstamp)
 
     def interp_col(grp):
@@ -31,7 +33,9 @@ def interp_to_time_per_ll(df,tstamp,lat_col='latitude',lon_col='longitude',
                          [value_col,'time_offset'])
 
     # for some reason, using apply() ignores as_index 
-    return df.groupby([lat_col,lon_col],as_index=False).apply(interp_col).reset_index()
+    result=df.groupby([lat_col,lon_col],as_index=False).apply(interp_col).reset_index()
+    assert np.all(np.isfinite(result[value_col].values))
+    return result
 
 
 def weighted_grid_extrapolation(g,samples,alpha=1e-5,
@@ -64,10 +68,15 @@ def weighted_grid_extrapolation(g,samples,alpha=1e-5,
 
     for i in range(len(samples)):
         if i%1000==0:
-            log.warning("%d/%d samples"%(i,len(samples)))
+            log.info("%d/%d samples"%(i,len(samples)))
             
         rec=samples.iloc[i]
-        weight=rec[weight_col]
+        if weight_col is None:
+            weight=1.0
+        else:
+            weight=rec[weight_col]
+            assert weight>0.0
+            
         if x_col is not None:
             xy=rec[[x_col,y_col]].values
         else:
@@ -84,17 +93,22 @@ def weighted_grid_extrapolation(g,samples,alpha=1e-5,
         D.set_flux(weight*rec[value_col],cell=cell,xy=xy)
         Dw.set_flux(weight,cell=cell,xy=xy)
 
-    log.warning("Construct 1st linear system")
+    log.info("Construct 1st linear system")
     D.construct_linear_system()
-    log.warning("Solve 1st linear system")
+    log.info("Solve 1st linear system")
     D.solve_linear_system(animate=False)
-    log.warning("Construct 2nd linear system")
+    log.info("Construct 2nd linear system")
     Dw.construct_linear_system()
-    log.warning("Solve 2nd linear system")
+    log.info("Solve 2nd linear system")
     Dw.solve_linear_system(animate=False)
 
     C=D.C_solved
     W=Dw.C_solved
+
+    assert np.all(np.isfinite(C))
+    assert np.all(np.isfinite(W))
+    assert np.all(W>0)
+    
     T=C / W
     if return_weights:
         return T,W

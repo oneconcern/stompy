@@ -28,6 +28,10 @@ def decompose(t,h,omegas):
     """
     t=np.asanyarray(t)
     omegas=np.asanyarray(omegas)
+
+    valid=np.isfinite(t)&np.isfinite(h)
+    t=t[valid]
+    h=h[valid]
     
     def sim(a,b):
         if a is b:
@@ -102,11 +106,17 @@ def noaa_37_omegas():
     """
     return frequencies in rad/sec for the 37 NOAA constituents
     """
-    idx = [tide_consts.const_names.index(n) for n in noaa_37_names()]
+    return names_to_omegas(noaa_37_names())
+
+def names_to_omegas(names):
+    """
+    return speed in radians/sec for the named constituents
+    """
+    idx = [tide_consts.const_names.index(n) for n in names]
     omega_deg_per_hour = tide_consts.speeds[idx]
     omega_per_sec = omega_deg_per_hour * (1./3600) * (1/360.)
     return 2*np.pi*omega_per_sec
-    
+
 
 def decompose_noaa37(t,h):
     return decompose(t,h,noaa_37_omegas())
@@ -114,7 +124,7 @@ def decompose_noaa37(t,h):
 
 def select_omegas(T,omegas=None,factor=0.25):
     """
-    T: timedelta64 giving duration of a timeseries
+    T: duration of a timeseries in seconds
     omegas: an array of angular frequencies in rad/s, defaults to
     the 37 constituents used in NOAA predictions.
 

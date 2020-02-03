@@ -147,7 +147,7 @@ def one_point_cost(pnt,edges,target_length=5.0):
     min_len = min( min_ab,min_ca )
     max_len = max( min_ab,min_ca )
 
-    undershoot = target_length**2 / min_len
+    undershoot = target_length**2 / min_len # TODO: min_len can be 0.0
     overshoot  = max_len / target_length**2
 
     length_penalty = 0
@@ -170,10 +170,10 @@ class Curve(object):
     """
     class CurveException(Exception):
         pass
-    
+
     def __init__(self,points,closed=True,ccw=None):
         """
-        points: [N,2] 
+        points: [N,2]
         closed: if True, treat this as a closed ring
         ccw: if True, make sure the order is ccw,
         False - make sure cw
@@ -183,7 +183,7 @@ class Curve(object):
             area=utils.signed_area(points)
             if (area>0) != bool(ccw):
                 points=points[::-1,:]
-                
+
         self.points=np.asarray(points)
         self.closed=bool(closed)
         if self.closed:
@@ -237,7 +237,7 @@ class Curve(object):
             npoints = max(1,round( l/local_scale ))
             alphas = np.arange(npoints) / float(npoints)
             alphas=alphas[:,None]
-            
+
             new_segment = (1.0-alphas)*A + alphas*B
             new_segments.append(new_segment)
             if return_sources:
@@ -494,13 +494,17 @@ class WallStrategy(Strategy):
         # at 90, we can try, but a bisect would be better.
         # at 180, this is the only option.
         return (180-theta) / 180
-
-    def execute(self,site):
+    def new_point(self,site):
         na,nb,nc= site.abc
         grid=site.grid
         b,c = grid.nodes['x'][ [nb,nc] ]
         bc=c-b
-        new_x = b + utils.rot(np.pi/3,bc)
+        return b + utils.rot(np.pi/3,bc)
+    def execute(self,site):
+        na,nb,nc= site.abc
+        grid=site.grid
+        
+        new_x = self.new_point(site)
         nd=grid.add_node(x=new_x,fixed=site.af.FREE)
 
         # new_c=grid.add_cell_and_edges( [nb,nc,nd] )
@@ -515,6 +519,24 @@ class WallStrategy(Strategy):
         return {'nodes': [nd],
                 'cells': [new_c] }
 
+class WallCloseStrategy(WallStrategy):
+    """
+    Wall, but with a very close-in initial guess point
+    """
+    def metric(self,site):
+        # always try regular Wall first.
+        return 0.5+super(WallCloseStrategy,self).metric(site)
+        
+    def new_point(self,site):
+        na,nb,nc= site.abc
+        grid=site.grid
+        b,c = grid.nodes['x'][ [nb,nc] ]
+        bc=c-b
+        usual_x=b + utils.rot(np.pi/3,bc)
+        midpoint=0.5*(b+c)
+        alpha=0.95
+        return alpha*midpoint + (1-alpha)*usual_x
+    
 class BisectStrategy(Strategy):
     """ 
     Add three edges and two new triangles.  
@@ -561,7 +583,6 @@ class BisectStrategy(Strategy):
                 'cells': [new_c1,new_c2],
                 'edges': [j_cd,j_bd,j_ad] }
     
-
 class ResampleStrategy(Strategy):
     """ TESTING: resample one step beyond.
     """
@@ -604,6 +625,7 @@ class ResampleStrategy(Strategy):
             if n in site.abc:
                 # went too far around!  Bad!
                 return n
+
             # Is this overly restrictive?  What if the edge is nice
             # and long, and just wants a node in the middle?
             # That should be allowed, until there is some way of annotating
@@ -651,8 +673,11 @@ class CutoffStrategy(Strategy):
         # Cutoff wants a small-ish internal angle
         # If the sites edges are long, scale_factor > 1
         # and we'd like to be making smaller edges, so ideal angle gets smaller
-        # 
-        if theta> 89*np.pi/180:
+
+        # this used to be a comparison to 89, but that is too strict.
+        # there could be an obtuse angle that we'd like to Cutoff and then
+        # optimize back to acute.
+        if theta>179*np.pi/180:
             return np.inf # not allowed
         else:
             ideal=60 + (1-scale_factor)*30
@@ -1018,6 +1043,7 @@ class NonLocalStrategy(Strategy):
 
 
 Wall=WallStrategy()
+WallClose=WallCloseStrategy()
 Cutoff=CutoffStrategy()
 Join=JoinStrategy()
 Bisect=BisectStrategy()
@@ -1080,7 +1106,7 @@ class TriangleSite(FrontSite):
         return ax.plot( points[:,0],points[:,1],'r-o' )[0]
     def actions(self):
         theta=self.internal_angle
-        return [Wall,Cutoff,Join,Bisect,NonLocal,Resample]
+        return [Wall,WallClose,Cutoff,Join,Bisect,NonLocal,Resample]
 
     def resample_neighbors(self):
         """ may update site! used to be part of AdvancingFront, but
@@ -1277,6 +1303,7 @@ class AdvancingFront(object):
         will be assigned to this ring via edges['oring'] and ['ring_sign']
         """
         if nodes is not None:
+            nodes=np.asarray(nodes)
             curve=self.grid.nodes['x'][nodes]
 
         if not isinstance(curve,Curve):
@@ -1317,7 +1344,7 @@ class AdvancingFront(object):
                     self.grid.edges['ring_sign'][j]=-1
                 else:
                     assert False,"Failed invariant"
-            
+
         return oring-1
 
     def instrument_grid(self,g):
@@ -1346,24 +1373,38 @@ class AdvancingFront(object):
         # if oring nonzero, then +1 if n1=>n2 is forward on the curve, -1 
         # otherwise
         g.add_edge_field('ring_sign',np.zeros(g.Nedges(),'i1'),on_exists='pass')
-        
+
         # Subscribe to operations *before* they happen, so that the constrained
         # DT can signal that an invariant would be broken
         self.cdt=self.shadow_cdt_factory(g)
-                          
+
         return g
 
     def shadow_cdt_factory(self,g):
-        try:
-            klass=shadow_cdt.ShadowCGALCDT
-        except AttributeError:
-            klass=shadow_cdt.ShadowCDT
+        """ 
+        Create a shadow CDT for the given grid.
+        This extra level of indirection is to facilitate
+        testing of one method vs the other in subclasses.
+        """
+        return shadow_cdt.shadow_cdt_factory(g)
 
-        return klass(g)
-        
-    def initialize_boundaries(self):
+    def initialize_boundaries(self,upsample=True):
+        """
+        Add nodes and edges to the the grid from curves.
+        if upsample is True, resample curves at scale.
+        """
         for curve_i,curve in enumerate(self.curves):
-            curve_points,srcs=curve.upsample(self.scale,return_sources=True)
+            # this is problematic when the goal is to have an
+            # entirely rigid set of nodes.
+            if upsample:
+                curve_points,srcs=curve.upsample(self.scale,return_sources=True)
+            else:
+                if curve.closed:
+                    # avoid repeated point
+                    curve_points=curve.points[:-1]
+                else:
+                    curve_points=curve.points
+                srcs=curve.distances[:len(curve_points)]
 
             # add the nodes in:
             # used to initialize as SLIDE
@@ -1451,8 +1492,8 @@ class AdvancingFront(object):
                             self.grid.nodes['x'][trav] )
         nodes.append(trav)
         return span,nodes
-    
-    max_span_factor=4     
+
+    max_span_factor=4
     def resample(self,n,anchor,scale,direction):
         """
         move/replace n, such that from anchor to n/new_n the edge
@@ -1476,7 +1517,6 @@ class AdvancingFront(object):
         """
         #self.log.debug("resample %d to be %g away from %d in the %s direction"%(n,scale,anchor,
         #                                                                        direction) )
-        
         if direction==1: # anchor to n is t
             he=self.grid.nodes_to_halfedge(anchor,n)
         elif direction==-1:
@@ -1486,10 +1526,13 @@ class AdvancingFront(object):
 
         n_deg=self.grid.node_degree(n)
 
+        if self.grid.nodes['oring'][n]==0:
+            self.log.debug("Node is not on a ring, no resampling possible")
+            return n
         # must be able to either muck with n, or split the anchor-n edge
         # in the past we assumed that this sort of check was already done
         j=he.j
-        edge_resamplable=( (self.grid.edges['fixed'][he.j]!=self.RIGID)
+        edge_resamplable=( (self.grid.edges['fixed'][j]!=self.RIGID)
                            and (self.grid.edges['cells'][j,0]<0)
                            and (self.grid.edges['cells'][j,1]<0) )
 
@@ -1505,7 +1548,7 @@ class AdvancingFront(object):
 
         span_length,span_nodes = self.free_span(he,self.max_span_factor*scale,direction)
         # anchor-n distance should be in there, already.
-        
+
         # self.log.debug("free span from the anchor is %g"%span_length)
 
         if span_length < self.max_span_factor*scale:
@@ -1723,8 +1766,8 @@ class AdvancingFront(object):
                 # This used to set fixed=SLIDE, but since there is no additional
                 # topology attached to nnew, it probably makes more sense for it
                 # to be HINT. changed 2018-02-26
-                jnew,nnew = self.grid.split_edge(j,x=new_x,ring_f=new_f,oring=oring+1,
-                                                 fixed=self.HINT)
+                jnew,nnew,j_next = self.grid.split_edge(j,x=new_x,ring_f=new_f,oring=oring+1,
+                                                        fixed=self.HINT)
         except self.cdt.IntersectingConstraints as exc:
             self.log.info("resample - slide() failed. will return node at original loc")
             self.grid.revert(cp)
@@ -1738,22 +1781,39 @@ class AdvancingFront(object):
         raise Exception("Implement in subclass")
 
     def eval_cost(self,n):
+        if self.grid.nodes['fixed'][n]==self.RIGID:
+            return 0.0
         fn=self.cost_function(n)
-        return (fn and fn(self.grid.nodes['x'][n]))
+        if fn:
+            return fn(self.grid.nodes['x'][n])
+        else:
+            return 0.0
 
-    def optimize_nodes(self,nodes,max_levels=3,cost_thresh=2):
+    cost_thresh_default=0.22
+    def optimize_nodes(self,nodes,max_levels=4,cost_thresh=None):
         """
         iterate over the given set of nodes, optimizing each location,
         and possibly expanding the set of nodes in order to optimize
         a larger area.
-        """
-        max_cost=0
 
+        2019-03-12: max_levels used to default to 3, but there were
+         cases where it needed a little more perseverance.
+         cost_thresh defaults to 0.22, following the tuning of paver.py
+        
+        """
+        if cost_thresh is None:
+            cost_thresh=self.cost_thresh_default
+            
         for level in range(max_levels):
+            max_cost=0
             for n in nodes:
                 # relax_node can return 0 if there was no cost
                 # function to optimize
-                max_cost=max(max_cost,self.relax_node(n) or 0.0)
+
+                # this node may already be good enough
+                if self.eval_cost(n)<cost_thresh: continue
+                new_cost=self.relax_node(n) or 0.0
+                max_cost=max(max_cost,new_cost)
             if max_cost <= cost_thresh:
                 break
             if level==0:
@@ -1788,7 +1848,7 @@ class AdvancingFront(object):
         def track_node_edits(g,func_name,n,**k):
             if n not in edits['nodes']:
                 edits['nodes'].append(n)
-                
+
         self.grid.subscribe_after('modify_node',track_node_edits)
         self.optimize_nodes(nodes,**kw)
         self.grid.unsubscribe_after('modify_node',track_node_edits)
@@ -1991,9 +2051,15 @@ class AdvancingFront(object):
         limits=[self.node_ring_f(m,n_ring)
                 for m in stops]
         # make sure limits are monotonic increasing.  for circular,
-        # this may require bumping up 
+        # this may require some modulo
         if curve.closed and (limits[0]>limits[1]):
-            limits[1] += curve.total_distance()
+            if limits[1] < n_f:
+                limits[1] += curve.total_distance()
+            elif limits[0] > n_f:
+                limits[0] -= curve.total_distance()
+            else:
+                assert False,"Not sure how to get the range to enclose n"
+                
         assert limits[0] < limits[1]
         return limits
     
@@ -2093,11 +2159,11 @@ class AdvancingFront(object):
             if count==0:
                 break
         return True
-            
+
     def advance_at_site(self,site):
         # This can modify site! May also fail.
         resampled_success = self.resample_neighbors(site)
-        
+
         actions=site.actions()
         metrics=[a.metric(site) for a in actions]
         bests=np.argsort(metrics)
@@ -2107,7 +2173,7 @@ class AdvancingFront(object):
                 self.log.info("Chose strategy %s"%( actions[best] ) )
                 edits=actions[best].execute(site)
                 opt_edits=self.optimize_edits(edits)
-                
+
                 failures=self.check_edits(opt_edits)
                 if len(failures['cells'])>0:
                     self.log.info("Some cells failed")
@@ -2206,7 +2272,9 @@ class AdvancingTriangles(AdvancingFront):
                 failures['cells'].append(c)
         return failures
 
-    cost_method='cc_py'
+    # cc_py is more elegant and crappier
+    cost_method='base'
+    cost_thresh_default=0.22
     def cost_function(self,n):
         """
         Return a function which takes an x,y pair, and evaluates
@@ -2251,7 +2319,7 @@ class AdvancingTriangles(AdvancingFront):
             C=list(x0)
             cc_cost=0
             scale_cost=0
-            
+
             for A,B in zip(Alist,Blist):
                 tri_cc=circumcenter_py(A,B,C)
 
@@ -2289,7 +2357,7 @@ class AdvancingTriangles(AdvancingFront):
                     this_cc_cost = ( math.exp(min(100,cc_fac*leftAB/magABs)) +
                                      math.exp(min(100,cc_fac*leftBC/magBCs)) +
                                      math.exp(min(100,cc_fac*leftCA/magCAs)) )
-                
+
                 # mixture
                 # 0.3: let's the scale vary too much between the cells
                 #      adjacent to n
@@ -2299,7 +2367,7 @@ class AdvancingTriangles(AdvancingFront):
                                   + (magBCs-avg_length)**2 
                                   + (magCAs-avg_length)**2 )
                 this_scale_cost/=avg_length*avg_length
-                
+
                 cc_cost+=this_cc_cost
                 scale_cost+=this_scale_cost
 
@@ -2509,7 +2577,7 @@ class DTNode(object):
         # in cases where init of the node makes some changes,
         # this should be updated
         self.cp=af.grid.checkpoint() 
-        self.active_child=None
+        self.active_child=None # we don't manipulate this, but just signal that it's fresh
     def set_options(self,options,priors):
         self.options=options
         self.child_prior=priors
@@ -2524,9 +2592,11 @@ class DTNode(object):
             return False
         return self.parent.revert_to_here()
     def revert_to_here(self):
+        """
+        rewind to the state when we first encountered this node 
+        """
         self.af.grid.revert(self.cp)
         self.af.current=self
-        self.active_child=None
 
     def try_child(self,i):
         assert False # implemented by subclass
@@ -2596,7 +2666,6 @@ class DTChooseSite(DTNode):
         self.child_post[i] = self.child_prior[i]
         
         self.af.current=self.children[i]
-        self.active_child=i
         return True
     
     def best_child(self,count=0,cb=None):
@@ -2662,4 +2731,5 @@ class DTChooseStrategy(DTNode):
         cost = np.max( [ (self.af.eval_cost(n) or 0.0)
                         for n in nodes] )
         self.child_post[i]=cost
+
         return True

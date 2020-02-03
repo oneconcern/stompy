@@ -86,13 +86,19 @@ def timedelta_to_waq_timestep(td):
     
     return "%08d%02d%02d%02d"%(days, hours, mins, secs)
 
-def rel_symlink(src, dst):
+def rel_symlink(src, dst, overwrite=False):
     """ Create a symlink, adjusting for a src path relative
     to cwd rather than the directory of dst. 
     """
     # given two paths that are either absolute or relative to
     # pwd, create a symlink that includes the right number of
     # ../..'s
+    if os.path.lexists(dst):
+        if not overwrite:
+            raise Exception("%s already exists, and overwrite is False"%dst)
+        else:
+            os.unlink(dst)
+            
     if os.path.isabs(src): # no worries
         os.symlink(src, dst)
     else:
@@ -235,7 +241,17 @@ class Hydro(object):
     # tested, leave this flag in place so it's easier to find where
     # the change is
     omit_inactive_exchanges=True
-    
+
+    # if True, allow symlinking to original files where possible.
+    # not directly relevant for some Hydro instances, but this will be
+    # used as the default for parameters, too.
+    enable_write_symlink=True
+
+    # Checks are only present in a few places, but generally, write*()
+    # methods should fail if files already exist and overwrite is not
+    # true.
+    overwrite=True
+
     @property
     def fn_base(self): # base filename for output. typically com-<scenario name>
         return 'com-{}'.format(self.scenario.name)
@@ -248,20 +264,9 @@ class Hydro(object):
     CLOSED=CLOSED
     BOUNDARY=BOUNDARY
 
-
     def __init__(self, **kws):
         self.log=logging.getLogger(self.__class__.__name__)
-
-        for k, v in kws.items():
-            # if k in self.__dict__ or k in self.__class__.__dict__:
-            #     self.__dict__[k]=v
-            # else:
-            #     raise Exception("Unknown keyword option: %s=%s"%(k,v))
-            try:
-                getattr(self,k)
-                setattr(self, k, v)
-            except AttributeError:
-                raise Exception("Unknown keyword option: %s=%s"%(k, v))
+        utils.set_keywords(self,kws)
 
     @property
     def t_dn(self):
@@ -317,7 +322,9 @@ class Hydro(object):
                                          self.scenario.stop_time])
         if start_i>0:
             start_i-=1
-        if stop_i < len(self.t_secs):
+        if stop_i <= len(self.t_secs):
+            # careful to check <= so we don't drop the last time
+            # step.
             stop_i+=1
         return self.t_secs[start_i:stop_i]
 
@@ -330,7 +337,8 @@ class Hydro(object):
         Write are file
         """
         with open(self.are_filename, 'wb') as fp:
-            for t_sec in self.scen_t_secs.astype('i4'):
+            for t_sec in utils.progress(self.scen_t_secs.astype('i4'),
+                                        msg="writing area: %s"):
                 fp.write(t_sec.tobytes()) # write timestamp
                 fp.write(self.areas(t_sec).astype('f4').tobytes())
 
@@ -343,7 +351,8 @@ class Hydro(object):
         Write flo file
         """
         with open(self.flo_filename, 'wb') as fp:
-            for t_sec in self.scen_t_secs.astype('i4'):
+            for t_sec in utils.progress(self.scen_t_secs.astype('i4'),
+                                        msg="writing flo: %s"):
                 fp.write(t_sec.tobytes()) # write timestamp
                 fp.write(self.flows(t_sec).astype('f4').tobytes())
 
@@ -448,7 +457,8 @@ class Hydro(object):
         """ write vol file
         """
         with open(self.vol_filename, 'wb') as fp:
-            for t_sec in self.scen_t_secs.astype('i4'):
+            for t_sec in utils.progress(self.scen_t_secs.astype('i4'),
+                                        msg="writing vol: %s"):
                 fp.write(t_sec.tobytes()) # write timestamp
                 fp.write(self.volumes(t_sec).astype('f4').tobytes())
 
@@ -523,10 +533,21 @@ class Hydro(object):
         except NotImplementedError:
             self.log.info("Bottom depths will be inferred")
 
-        self.log.debug("Adding VertDisper parameter")
-        hyd['VertDisper']=ParameterSpatioTemporal(func_t=self.vert_diffs,
-                                                  times=self.t_secs,
-                                                  hydro=self)
+        try:
+            # Hmm - clunky, but not a good existing way to deterine whether
+            # there is vertical diffusion data or not
+            self.vert_diffs(0)
+            has_vert_diffs=True
+        except Exception as exc:
+            self.log.info("No vertical dispersion (%s)"%str(exc))
+            has_vert_diffs=False
+
+        if has_vert_diffs:
+            self.log.debug("Adding VertDisper parameter")
+            hyd['VertDisper']=ParameterSpatioTemporal(func_t=self.vert_diffs,
+                                                      times=self.t_secs,
+                                                      hydro=self)
+
         self.log.debug("Adding depths parameter")
         try:
             hyd['DEPTH']=self.depths()
@@ -535,6 +556,11 @@ class Hydro(object):
         return hyd
 
     def write(self):
+        """
+        Write hydro data out or link to existing files.
+        overwrite: if true, will overwrite existing files.  Not fully implemented yet,
+        no guarantees.
+        """
         self.log.debug('Writing 2d links')
         self.write_2d_links()
         self.log.debug('Writing boundary links')
@@ -718,6 +744,17 @@ class Hydro(object):
             self.seg_k=seg_k
         return self.seg_to_2d_element
 
+    def segment_select(self,element,k):
+        """
+        Identify segment IDs by element and layer. This was referenced
+        in some Load code, but somehow did not exist in hydro. May be expanded in the
+        future to allow other means of identifying segments.
+        returns an array of segment ids
+        """
+        self.infer_2d_elements()
+        idxs=np.nonzero( (self.seg_to_2d_element==element) & (self.seg_k==k) )[0]
+        return idxs
+    
     def extrude_element_to_segment(self,V):
         """ V: [n_2d_elements] array
         returns [n_seg] array
@@ -874,7 +911,7 @@ class Hydro(object):
 
         try:
             plan_areas=self.planform_areas()
-        except FileNotFoundError:
+        except OSError: # FileNotFoundError only exists in >=3.3
             plan_areas=None
 
         # Supply more info to the callback
@@ -997,7 +1034,11 @@ class Hydro(object):
                         exchs=np.nonzero(-self.pointers[:,0] == bdry0+1)[0]
                         assert len(exchs)==1 # may be relaxable.
                         exch=exchs[0]
-                        bdefs['type'][bdry0] = bc_lgroups['name'][self.exch_to_2d_link['link'][exch]]
+                        # 2018-11-29: getting some '0' types.
+                        # this is because exch_link is mapping to a non-boundary
+                        # link.
+                        exch_link=self.exch_to_2d_link['link'][exch]
+                        bdefs['type'][bdry0] = bc_lgroups['name'][exch_link]
                     self.log.info("Done setting boundary info")
             else:
                 raise ValueError("Boundary scheme is bad: %s"%self.boundary_scheme)
@@ -1044,10 +1085,29 @@ class Hydro(object):
                     raise
         return x
 
-    def timeline_data(self):
+    def timeline_scen(self):
+        """
+        This used to be timeline_data, but the implementation was not consistent 
+        between classes.
+        For clarity, it is now timeline_scen to reflect that it limits the time 
+        frame to that of the scenario.
+        """
         scu=self.scenario.scu
         time_start = (self.time0+self.scen_t_secs[0] *scu)
         time_stop  = (self.time0+self.scen_t_secs[-1]*scu)
+        timedelta  = (self.t_secs[1] - self.t_secs[0])*scu
+        return time_start,time_stop,timedelta
+
+    def timeline_data(self):
+        """
+        Hydro::timeline_data() used to used scen_t_secs, but HydroFiles
+        contined to use t_secs.  This is now explicitly reflecting the
+        period of the data, and timeline_scen() is the time frame for
+        the scenario's subset of the data.
+        """
+        scu=self.scenario.scu
+        time_start = (self.time0+self.t_secs[0] *scu)
+        time_stop  = (self.time0+self.t_secs[-1]*scu)
         timedelta  = (self.t_secs[1] - self.t_secs[0])*scu
         return time_start,time_stop,timedelta
     
@@ -1076,8 +1136,11 @@ class Hydro(object):
         fn=fn or os.path.join( self.scenario.base_path,
                                self.fn_base+".hyd")
         if os.path.exists(fn):
-            self.log.warning("hyd file %s already exists.  Not overwriting!"%fn)
-            return
+            if self.overwrite:
+                os.unlink(fn)
+            else:
+                self.log.warning("hyd file %s already exists.  Not overwriting!"%fn)
+                return
         
         name=self.scenario.name
 
@@ -1085,7 +1148,11 @@ class Hydro(object):
 
         scu=self.scenario.scu
 
-        time_start,time_stop,timedelta = self.timeline_data()
+        # If symlinking, we want to report the full time period.
+        if self.enable_write_symlink:
+            time_start,time_stop,timedelta=self.timeline_data()
+        else:
+            time_start,time_stop,timedelta = self.timeline_scen()
             
         timestep = timedelta_to_waq_timestep(timedelta)
 
@@ -1093,10 +1160,17 @@ class Hydro(object):
         n_layers=1+self.seg_k.max()
 
         # New code - maybe not right at all.
+        # This code is also duplicated across several of the classes in this file.
+        # crying out for refactoring.
         if 'temp' in self.parameters():
             temp_file="'%s-temp.seg'"%name
         else:
             temp_file='none'
+            
+        if 'tau' in self.parameters():
+            tau_file="'%s-tau.seg'"%name
+        else:
+            tau_file='none'
             
         lines=[
             "file-created-by  SFEI, waq_scenario.py",
@@ -1140,7 +1214,7 @@ class Hydro(object):
             "vert-diffusion-file   '%s-vertdisper.seg'"%name,
             # not a segment function!
             "surfaces-file         '%s'"%self.surf_filename,
-            "shear-stresses-file   none",
+            "shear-stresses-file   %s"%tau_file,
             "hydrodynamic-layers",
             "\n".join( ["%.5f"%(1./n_layers)] * n_layers ),
             "end-hydrodynamic-layers",
@@ -1185,21 +1259,43 @@ class Hydro(object):
             # so here they will get lumped together, but the datastructure should
             # allow for them to be distinct.
 
+            seg_bc_count=defaultdict(int)
+            
             for exch_i,(a,b,_,_) in enumerate(poi0[:self.n_exch_x+self.n_exch_y]):
-                if a>=0:
-                    a2d=self.seg_to_2d_element[a]
-                else:
-                    a2d=-1 # ??
-                if b>=0:
-                    b2d=self.seg_to_2d_element[b]
-                else:
-                    b2d=-1 # ??
-
-                if a2d<0 and b2d<0:
+                if a<0 and b<0:
                     # probably DFM writing dense exchanges information for segment
                     # which don't exist.  I think it's safest to just not include these
                     # at all.
                     continue
+                
+                if a>=0:
+                    a2d=self.seg_to_2d_element[a]
+                else:
+                    # this is a source of the problem mentioned above, since
+                    # we throw away an unique identity of distinct boundary
+                    # exchanges here.
+                    # a2d=-1 # ??
+                    # instead, count up how many bc exchanges hit this segment
+                    # first one will be -1, but we can see distinct additional
+                    # exchanges as -2, -3, etc.
+                    # the 'b' here is because we are labeling boundary a values
+                    # with the count of bcs entering b.
+                    seg_bc_count[b]+=1
+                    a2d=-seg_bc_count[b]
+                if b>=0:
+                    b2d=self.seg_to_2d_element[b]
+                else:
+                    #b2d=-1 # ??
+                    # see above comments for a
+                    seg_bc_count[a]+=1
+                    b2d=-seg_bc_count[a]
+
+                # cruft -- just a reminder, now tested with a,b above.
+                #if a2d<0 and b2d<0:
+                #    # probably DFM writing dense exchanges information for segment
+                #    # which don't exist.  I think it's safest to just not include these
+                #    # at all.
+                #    continue
                 
                 if (b2d,a2d) in mapped:
                     exch_to_2d_link['link'][exch_i] = mapped[(b2d,a2d)]
@@ -1260,7 +1356,70 @@ class Hydro(object):
         np.savetxt(os.path.join(path,'exch_to_2d_link.csv'),
                    self.exch_to_2d_link,fmt='%d')
 
-    def path_to_transect_exchanges(self,xy,on_boundary='warn_and_skip'):
+    def flowlink_to_edge(self,g):
+        """
+        Create a sparse matrix that maps a per-flowlink, signed quantity (i.e. flow)
+        to the edges of g. BC flows entering at the boundary are handled, but
+        internal outfalls are ignored.
+        """
+        from scipy import sparse
+        self.infer_2d_links()
+        M=sparse.dok_matrix( (g.Nedges(),self.n_2d_links), np.float64)
+        e2c=g.edge_to_cells()
+        geom=self.get_geom()
+
+        cc=g.cells_center()
+        elem_xy=np.c_[ geom.FlowElem_xcc.values,
+                       geom.FlowElem_ycc.values ]
+
+        def elt_to_cell(elt):
+            # in general elts are preserved as the same cell index,
+            # and this is actually more robust then the geometry
+            # check because of some non-orthogonal cells that have
+            # a circumcenter outside the corresponding cell.
+            if utils.dist(elem_xy[elt] - cc[elt])<2.0:
+                return elt
+            # in a few cases the circumcenter is not inside the cell,
+            # so better to select the nearest circumcenter than the
+            # cell containing it.
+            c=g.select_cells_nearest(elem_xy[elt],inside=False)
+            assert c is not None
+            return c
+        
+        for link,(eltA,eltB) in utils.progress(enumerate(self.links)):
+            assert eltB>=0
+            cB=elt_to_cell(eltB)
+            
+            if eltA<0: # eltA<0 means it's a boundary.
+                # so find a boundary edge for that cell
+                for j in g.cell_to_edges(cB):
+                    if e2c[j,0]<0:
+                        sgn=1
+                        break
+                    elif e2c[j,1]<0:
+                        sgn=-1
+                        break
+                else:
+                    print("Link %d -- %d does not map to a grid boundary, likely a discharge, and will be ignored."%(eltA,eltB))
+                    # This is probably a discharge. Ignore it.
+                    continue
+            else:
+                cA=elt_to_cell(eltA)
+                j=g.cells_to_edge(cA,cB)
+                if j is None:
+                    raise Exception("%d to %d was not an edge in the grid"%(eltA,eltB))
+                if (e2c[j,0]==cA) and (e2c[j,1]==cB):
+                    # positive DWAQ flow is A->B
+                    # positive edge normal for grid is the same
+                    sgn=1
+                elif (e2c[j,1]==cA) and (e2c[j,0]==cB):
+                    sgn=-1
+                else:
+                    raise Exception("Bad match on link->edge")
+            M[j,link]=sgn
+        return M
+                
+    def path_to_transect_exchanges(self,xy,on_boundary='warn_and_skip',on_edge=False):
         """
         xy: [N,2] points.
         Each point is mapped to a node of the grid, and grid edges
@@ -1273,17 +1432,24 @@ class Hydro(object):
         on_boundary:
          'warn_and_skip': any of the edges which are closed edges in the original
             grid (unless a flow boundary), are mentioned, but omitted.
+        on_edge: xy are already on the edges of the polygons [from Zhenlin Zhang].
         """
         # align the input nodes along nodes of the grid
         g=self.grid()
         input_nodes=[g.select_nodes_nearest(p)
                      for p in xy]
-        legs=[ input_nodes[0] ] 
-        for a,b in zip(input_nodes[:-1],input_nodes[1:]):
-            if a==b:
-                continue
-            path=g.shortest_path(a, b)
-            legs+=list(path[1:])
+        if on_edge:
+            # RH 2020-01-31: In theory this shouldn't be needed --
+            # ot sure if ZZ was working around a bug, or if the original
+            # code was slow. 
+            legs=input_nodes
+        else:
+            legs=[ input_nodes[0] ] 
+            for a,b in zip(input_nodes[:-1],input_nodes[1:]):
+                if a==b:
+                    continue
+                path=g.shortest_path(a, b)
+                legs+=list(path[1:])
 
         self.infer_2d_links()
 
@@ -1479,26 +1645,38 @@ class Hydro(object):
                 ngroups+=1
         return groups
 
+    # Data formats on disk
+    def flo_dtype(self):
+        return np.dtype([ ('tstamp','<i4'),
+                          ('flow','<f4',self.n_exch) ])
+    def are_dtype(self):
+        return np.dtype([ ('tstamp','<i4'),
+                          ('area','<f4',self.n_exch) ])
+    def vol_dtype(self):
+        return np.dtype([ ('tstamp','<i4'),
+                          ('volume','<f4',self.n_seg) ])
+
+    
 def parse_datetime(s):
     """ 
     parse YYYYMMDDHHMMSS style dates.
     strips single quotes in case it came from a hyd file
     """
-    return datetime.datetime.strptime(s.strip("'"),'%Y%m%d%H%M%S')        
+    return datetime.datetime.strptime(s.strip("'"),'%Y%m%d%H%M%S')
 
 class HydroFiles(Hydro):
-    """ 
+    """
     DWAQ hydro data read from existing files, by parsing
     .hyd file.
     """
-    # if True, allow symlinking to original files where possible.
-    enable_write_symlink=False
-
     def __init__(self,hyd_path,**kw):
         self.hyd_path=hyd_path
         self.parse_hyd()
 
         super(HydroFiles,self).__init__(**kw)
+        if sys.platform=='win32' and self.enable_write_symlink:
+            self.log.warning("Symlinks disabled on windows")
+            self.enable_write_symlink=False            
 
     def parse_hyd(self):
         self.hyd_toks={}
@@ -1547,16 +1725,6 @@ class HydroFiles(Hydro):
             self._t_secs=(start+np.arange(n_steps)*step_secs).astype('i4')
         return self._t_secs
 
-    def timeline_data(self):
-        # May need to be more clever about generated datasets
-        # probably needs to be sync'd with whether we symlink, reference
-        # original files, write out a subset...
-        scu=self.scenario.scu
-        time_start = (self.time0+self.t_secs[0]* scu)
-        time_stop  = (self.time0+self.t_secs[-1]*scu)
-        timedelta  = (self.t_secs[1]- self.t_secs[0])*scu
-        return time_start,time_stop,timedelta
-    
     @property
     def time0(self):
         return parse_datetime(self.hyd_toks['conversion-ref-time'])
@@ -1610,9 +1778,8 @@ class HydroFiles(Hydro):
             n_elts=nx*ny
             # bit of sanity check:
             if os.path.exists(self.get_path('grid-coordinates-file')):
-                nc=qnc.QDataset( self.get_path('grid-coordinates-file') )
-                n_elts_nc=len(nc.dimensions['nFlowElem'])
-                nc.close()
+                g=dfm_grid.DFMGrid(self.get_path('grid-coordinates-file'))
+                n_elts_nc=g.Ncells() 
                 assert n_elts_nc==n_elts
 
             # assumes dense exchanges
@@ -1696,7 +1863,7 @@ class HydroFiles(Hydro):
             return super(HydroFiles,self).write_are()
         else:
             rel_symlink(self.get_path('areas-file'),
-                        self.are_filename)
+                        self.are_filename,overwrite=self.overwrite)
 
     def areas(self,t):
         ti_req=ti=self.t_sec_to_index(t)
@@ -1733,7 +1900,8 @@ class HydroFiles(Hydro):
             return super(HydroFiles,self).write_vol()
         else:
             rel_symlink(self.get_path('volumes-file'),
-                        self.vol_filename)
+                        self.vol_filename,
+                        overwrite=self.overwrite)
 
     def volumes(self,t):
         return self.seg_func(t,label='volumes-file')
@@ -1813,14 +1981,19 @@ class HydroFiles(Hydro):
             return f(t_sec)
 
     def vert_diffs(self,t_sec):
+        # This used to have a really screwy label
         return self.seg_func(t_sec,label='vert-diffusion-file')
 
     def write_flo(self):
+        # TODO: allow an option to avoid copying, and just supply
+        # the original path.  this is tested in windows, no need
+        # to escape backslash, seems okay with long lines.
         if not self.enable_write_symlink:
             return super(HydroFiles,self).write_flo()
         else:
             rel_symlink(self.get_path('flows-file'),
-                        self.flo_filename)
+                        self.flo_filename,
+                        overwrite=self.overwrite)
 
     _flows_mmap=None
     def flows(self,t,memmap=False):
@@ -1840,9 +2013,7 @@ class HydroFiles(Hydro):
 
         if memmap and self._flows_mmap is not False:
             if self._flows_mmap is None:
-                dtype=[ ('tstamp','<i4'),
-                        ('flow','<f4',self.n_exch) ]
-                self._flows_mmap=np.memmap(flo_fn, dtype,
+                self._flows_mmap=np.memmap(flo_fn, self.flo_dtype(),
                                            mode='r')
             if ti>=len(self._flows_mmap):
                 self.log.warning("Flow data ends early by %d steps"%(len(self.t_secs)-1-ti))
@@ -1915,7 +2086,7 @@ class HydroFiles(Hydro):
         """
         # Find all segments which have a boundary exchange
         bc_exchs=np.nonzero( self.pointers[:,0]<0 )[0]
-        bc_adj_segs=self.pointers[bc_exchs,1]-1
+        bc_adj_segs=self.pointers[bc_exchs,1]-1 # make 0-based
 
         def cb(ti,summary):
             print("ti=%5d: RMS Q_err: %.5f"%(ti,utils.rms(summary['Q_err'])))
@@ -2046,6 +2217,13 @@ class HydroFiles(Hydro):
 
         dest=os.path.join(self.scenario.base_path,
                           self.flowgeom_filename)
+        if os.path.exists(dest) or os.path.lexists(dest):
+            if self.overwrite:
+                self.log.warning("Removing old geom file %s"%dest)
+                os.unlink(dest)
+            else:
+                raise Exception("Overwrite is not true, and geometry file %s already exists"%dest)
+                
         if self.enable_write_symlink:
             rel_symlink(orig,dest)
         else:
@@ -2065,10 +2243,8 @@ class HydroFiles(Hydro):
             except KeyError:
                 return None
             try:
-                #ug=ugrid.Ugrid(orig)
-                #self._grid=ug.grid()
                 self._grid=unstructured_grid.UnstructuredGrid.from_ugrid(orig)
-            except (IndexError,AssertionError):
+            except (IndexError,AssertionError,unstructured_grid.GridException):
                 self.log.warning("Grid wouldn't load as ugrid, trying dfm grid")
                 dg=dfm_grid.DFMGrid(orig)
                 self._grid=dg
@@ -2078,15 +2254,17 @@ class HydroFiles(Hydro):
         super(HydroFiles,self).add_parameters(hyd)
 
         # can probably add bottomdept,depth,salinity.
-
+        self.log.debug("Incoming parameters are %s"%list(hyd.keys()))
+        
         # do NOT include surfaces-files here - it's a different format.
         for var,key in [('vertdisper','vert-diffusion-file'),
-                        #('tau','shear-stresses-file'),
+                        ('tau','shear-stresses-file'),  # play 'em if you got 'em.
                         ('temp','temperature-file'),
                         ('salinity','salinity-file')]:
             fn=self.get_path(key)
             if os.path.exists(fn):
-                hyd[var]=ParameterSpatioTemporal(seg_func_file=fn,enable_write_symlink=True,
+                self.log.debug("%s does exist, so will add it to the parameters"%fn)
+                hyd[var]=ParameterSpatioTemporal(seg_func_file=fn,
                                                  hydro=self)
         return hyd
 
@@ -2096,11 +2274,12 @@ class HydroFiles(Hydro):
         If the files don't exist, return False, log an info message.
         """
         path = self.get_dir()
-        try:
-            links=np.loadtxt(os.path.join(path,'links.csv'),dtype='i4')
+        links_fn=os.path.join(path,'links.csv')
+        if os.path.exists(links_fn):
+            links=np.loadtxt(links_fn,dtype='i4')
             exch_to_2d_link = np.loadtxt(os.path.join(path,'exch_to_2d_link.csv'),
                                          dtype=[('link','i4'),('sgn','i4')])
-        except FileNotFoundError:
+        else:
             return False
         self.links=links
         self.exch_to_2d_link=exch_to_2d_link
@@ -2182,6 +2361,8 @@ class HydroFiles(Hydro):
 
                 # This is a 0-based link index
                 link0=self.exch_to_2d_link['link'][exch_i]
+                if gbl['id'][link0]>=0:
+                    print("WARNING: multiple id values map to the same link (%s)"%bnd[0])
                 gbl['id'][link0]=rec_i
                 gbl['name'][link0]=bnd[0]
 
@@ -2191,6 +2372,13 @@ class HydroFiles(Hydro):
                 other['geom']=other['wkt'] # follow previous interface, leaving geom
                 # as text wkt.
                 gbl['attrs'][link0]=other
+        # 2018-12-12: losing some boundary links on re-reading aggregated
+        # output.  at least warn if boundary links did not get labeled
+        n_bc_links=(self.links[:,0]<0).sum()
+        n_grouped_links=(gbl['id']>=0).sum()
+        if n_bc_links!=n_grouped_links:
+            self.log.warning("labeling boundary links: %d expected bc links != %d that got names from bnd"%
+                             (n_bc_links,n_grouped_links))
         return gbl
     
     def read_bnd(self):
@@ -2273,6 +2461,10 @@ class DwaqAggregator(Hydro):
     # # 'centroids': use element centroids
     horizontal_length_scales='subdomain,geometric'
 
+    # Rather than loading DWAQ flowgeom netcdf, try to load DFM map output, which
+    # can have more information.
+    flowgeom_use_dfm_map=True
+    
     # how many of these can be factor out into above classes?
     # agg_shp: can specify, but if not specified, will try to generate a 1:1 
     #   mapping
@@ -2342,6 +2534,19 @@ class DwaqAggregator(Hydro):
         
         return self._flowgeoms[p]
 
+    def dfm_map_file(self,p):
+        """
+        Try to infer the name of the dfm map output for processor p, and
+        if it exists, return that path.
+        """
+        assert p==0,"For HydroAggregator, only serial runs are supported."
+        map_fn=self.hydro_in.hyd_path.replace("DFM_DELWAQ_","DFM_OUTPUT_").replace('.hyd','_map.nc')
+        if os.path.exists(map_fn):
+            return map_fn
+        else:
+            self.log.warning("Tried to find DFM map output at %s, but it wasn't there"%map_fn)
+            return None
+    
     _flowgeoms_xr=None
     def open_flowgeom_ds(self,p):
         """ Same as open_flowgeom(), but transitioning to xarray dataset instead of qnc.
@@ -2354,40 +2559,173 @@ class DwaqAggregator(Hydro):
 
         if p not in self._flowgeoms_xr:
             hyd=self.open_hyd(p)
-            fg=xr.open_dataset(hyd.get_path('grid-coordinates-file'))
+            flowgeom_fn=hyd.get_path('grid-coordinates-file')
+            # some information is here, but not in the map file,
+            # so always try to open this, and optionally try to open the map, too.
+            fg_ds=ds=xr.open_dataset(flowgeom_fn)
+            map_ds=None
             
-            if ('NetNode_x' in fg) and ('NetElemNode' in fg['NetNode_x'].dims):
+            if self.flowgeom_use_dfm_map:
+                if p==0:
+                    msg=self.log.info
+                else:
+                    msg=self.log.debug
+                msg("[proc=%d] Checking to see if a DFM map file can be used instead of flowgeom"%p)
+                map_fn=self.dfm_map_file(p)
+                if map_fn:
+                    msg("Yes - will load %s"%map_fn)
+                    map_ds=xr.open_dataset(map_fn)
+                    
+                    # when map is available, use it, but remember fg_ds is also still around for
+                    # things like global element number
+                    ds=map_ds
+            
+            # if this is ugrid output, include copies of some variables to their pre-ugrid
+            # names
+            for old,new in [ ('NetNode_x','mesh2d_node_x'),
+                             ('NetNode_y','mesh2d_node_y'),
+                             ('NetNode_z','mesh2d_node_z'),
+                             ('NetElemNode','mesh2d_face_nodes'),
+                             # some duplicates because newer DFM output varies
+                             ('FlowElemGlobalNr','mesh2d_face_global_number'),
+                             ('FlowElemGlobalNr','mesh2d_flowelem_globalnr'),
+                             ('FlowElemDomain','mesh2d_face_domain_number'),
+                             ('FlowElemDomain','mesh2d_flowelem_domain'),
+                             ('FlowElem_bl','mesh2d_flowelem_bl'),
+                             ('FlowElem_bac','mesh2d_flowelem_ba')
+                             ]:
+                if old in ds: continue
+                
+                if new in ds:
+                    data=ds[new] # should just be a shallow copy.  cheap.
+                elif old in fg_ds:
+                    # waqgeom / flowgeom might have it?
+                    data=fg_ds[old].copy()
+                elif new in fg_ds:
+                    # waqgeom / flowgeom might have the new version.
+                    data=fg_ds[new].copy()
+                else:
+                    # still no source for this. move on.
+                    continue 
+                    
+                # also some of those index fields are saved as float(?!)
+                if old in ['FlowElemDomain','FlowElemGlobalNr','NetElemNode']:
+                    data.values[ np.isnan(data.values) ]=-999999
+                    data=data.astype(np.int32)
+
+                ds[old]=data
+
+            # special handling for other dimensions
+            if 'nFlowElem' not in ds.dims and 'nmesh2d_face' in ds.dims:
+                # helps down the line to make this its own dimension, not just reuse
+                # the dimension from nmesh2d_face.
+                ds['nFlowElem']=('nFlowElem',),ds['nmesh2d_face'].values
+            
+            if ('NetNode_x' in ds) and ('NetElemNode' in ds['NetNode_x'].dims):
                 self.log.info("Trying to triage bad dimensions in NetCDF (probably ddcouplefm output)")
-                netnode_x=fg.NetNode_x.values
-                netnode_y=fg.NetNode_y.values
-                netnode_z=fg.NetNode_z.values
+                netnode_x=ds.NetNode_x.values
+                netnode_y=ds.NetNode_y.values
+                netnode_z=ds.NetNode_z.values
 
-                del fg['NetNode_x']
-                del fg['NetNode_y']
-                del fg['NetNode_z']
+                del ds['NetNode_x']
+                del ds['NetNode_y']
+                del ds['NetNode_z']
 
-                netelemnode = fg.NetElemNode.values
-                del fg['NetElemNode']
+                netelemnode = ds.NetElemNode.values
+                del ds['NetElemNode']
 
-                fg['NetNode_x']=('nNetNode',),netnode_x
-                fg['NetNode_y']=('nNetNode',),netnode_y
-                fg['NetNode_z']=('nNetNode',),netnode_z
-                fg['NetElemNode']=('nNetElem','nNetElemMaxNode'),netelemnode
+                ds['NetNode_x']=('nNetNode',),netnode_x
+                ds['NetNode_y']=('nNetNode',),netnode_y
+                ds['NetNode_z']=('nNetNode',),netnode_z
+                ds['NetElemNode']=('nNetElem','nNetElemMaxNode'),netelemnode
                     
             if self.nprocs==1:
                 elem_dim='nFlowElem'
-                link_dim='nFlowLink'
-                n_elem=len(fg[elem_dim])
-                n_link=len(fg[link_dim])
-                if 'FlowElemGlobalNr' not in fg:
+                n_elem=len(ds[elem_dim])
+                if 'FlowElemGlobalNr' not in ds:
                     self.log.info("Synthesizing multi domain data for single domain run")
-                    fg['FlowElemGlobalNr']=(elem_dim,),1+np.arange(n_elem,dtype=np.int32)
-                if 'FlowElemDomain' not in fg:
-                    fg['FlowElemDomain']  =(elem_dim,),np.zeros(n_elem,np.int32)
-                if 'FlowLinkDomain' not in fg:
-                    fg['FlowLinkDomain']  =(link_dim,),np.zeros(n_link,np.int32)
-            
-            self._flowgeoms_xr[p] = fg
+                    ds['FlowElemGlobalNr']=(elem_dim,),1+np.arange(n_elem,dtype=np.int32)
+                if 'FlowElemDomain' not in ds:
+                    ds['FlowElemDomain']  =(elem_dim,),np.zeros(n_elem,np.int32)
+                    
+            # This had been just for nprocs==1.  But it's needed for MPI, too.
+            if 'FlowLink' not in ds:
+                link_dim='nFlowLink'
+
+                # when FlowLink is not present, go ahead and create it, by
+                # looking at edge_type==1 or 2, which should encompass all edges
+                # with flow.
+                edge_type=ds.mesh2d_edge_type.values
+                
+                # array that is indexed by flowlink, and returns the
+                # edge index.
+                # generally it could be more complicated, but 
+                # based on a single comparison between two runs, exactly the same
+                # except for MapFormat, the FlowLinks are in the same order
+                # as the edges, it's just that the edges have the extra closed_boundary
+                # edges.
+                self.flowlink_to_edge=np.nonzero( (edge_type==1)|(edge_type==2) )[0]
+                n_flowlinks=len(self.flowlink_to_edge)
+
+                # Fill in FlowLink-related fields --
+                ds['FlowLink_xu']=(link_dim,), ds.mesh2d_edge_x.values[self.flowlink_to_edge]
+                ds['FlowLink_yu']=(link_dim,), ds.mesh2d_edge_y.values[self.flowlink_to_edge]
+
+                # fabricating FlowLink.  This is more complicated because of how boundaries
+                # are handled.  Tested to some degree, but this is getting into DFM details
+                # that may not be documented or guaranteed to stay the same.
+                # Starting point - just the subset of edges that are flow links
+                FlowLink=ds.mesh2d_edge_faces.values[self.flowlink_to_edge,:]
+                # swap out nan for -1 and switch to integers
+                FlowLink[ np.isnan(FlowLink) ] = -1
+                # somehow in this case the boundary elements are coming in as 0, while in
+                # testing external to this code they were nan.
+                # try to hedge by assuming any index less than start_index is a boundary,
+                # and default to start_index of 1 since that is what DFM has generally used
+                # here.  The general UGRID/CF default is 0, but there is a better chance
+                # of somebody dropping the attribute, than of DFM silently switching to
+                # the default value.
+                start_index=ds.mesh2d_edge_faces.attrs.get('start_index',1)
+                FlowLink[ FlowLink<start_index ] = -1
+
+                FlowLink=FlowLink.astype(np.int32)
+                # Which links are boundary links?
+                # The ordering of elements for links gets screwy. Format=1 this is
+                # moot, since it already includes FlowLinks.  Format=4, it seems that
+                # flowgeom files get nan-valued boundary elements placed in the second
+                # column.  but a map file from the same run doesn't constrain the ordering
+                # and the 0-valued boundary elements can appear in either column.
+                # so this code tries to accommodate both, while still including some
+                # sanity checks
+                bc_links=(FlowLink.min(axis=1)<0)
+                bc_link_flip=FlowLink[:,1]<0
+                # map files may not need all links flipped.
+                FlowLink[bc_link_flip]=FlowLink[bc_link_flip,::-1]
+                # minor sanity check
+                assert np.all(FlowLink[:,1]>=start_index),"Bad assumption on boundary links"
+
+                # and boundary elements get numbered beyond the number of regular elements.
+                FlowLink[bc_links,0]=ds.dims['nmesh2d_face'] + 1 + np.arange(bc_links.sum())
+
+                assert np.all(FlowLink[:,0]>=start_index),"Missed some boundary links??"
+
+                ds['FlowLink'] = (link_dim,'nFlowLinkPts'), FlowLink
+
+                # type 2 is flow link between 2D elements. Will have to change if/when we get into
+                # mixed 1D/2D/3D grids.
+                ds['FlowLinkType']=(link_dim,), 2*np.ones(n_flowlinks,np.int32)
+                # ignore FlowLink_lonu, FlowLink_latu
+
+                print("FlowLink near end of open_flowgeom_ds(%d), id(ds)=%s"%(p,id(ds)))
+                print(ds.FlowLink)
+
+                if 'FlowLinkDomain' not in ds:
+                    # use the element domains, grabbing the internal/2nd flow element from
+                    # each link.
+                    # remember that FlowLink has 1-based numbering
+                    ds['FlowLinkDomain']  =(link_dim,),ds['FlowElemDomain'].values[FlowLink[:,1]-start_index]
+                        
+            self._flowgeoms_xr[p] = ds
             
         return self._flowgeoms_xr[p]
 
@@ -2450,13 +2788,19 @@ class DwaqAggregator(Hydro):
         self.n_agg_elements_2d=len(box_polys)
 
         agg_elts_2d=[]
+        # used to work, but appears to be broken with newer python
+        #    for agg_i in range(self.n_agg_elements_2d):
+        #        elem=np.zeros((),dtype=self.agg_elt_2d_dtype)
+        #        elem['name']=box_names[agg_i]
+        #        elem['poly']=box_polys[agg_i]
+        #        agg_elts_2d.append(elem)
+        #    # per http://stackoverflow.com/questions/15673155/keep-getting-valueerror-with-numpy-while-trying-to-create-array
+        #    self.elements=rfn.stack_arrays(agg_elts_2d)
+        # 2018-10-01 RH: try different approach.  should be faster, better anyway.
+        self.elements=np.zeros(self.n_agg_elements_2d,dtype=self.agg_elt_2d_dtype)
         for agg_i in range(self.n_agg_elements_2d):
-            elem=np.zeros((),dtype=self.agg_elt_2d_dtype)
-            elem['name']=box_names[agg_i]
-            elem['poly']=box_polys[agg_i]
-            agg_elts_2d.append(elem)
-        # per http://stackoverflow.com/questions/15673155/keep-getting-valueerror-with-numpy-while-trying-to-create-array
-        self.elements=rfn.stack_arrays(agg_elts_2d)
+            self.elements['name'][agg_i]=box_names[agg_i]
+            self.elements['poly'][agg_i]=box_polys[agg_i]
 
     def find_maxima(self):
         """
@@ -2470,14 +2814,33 @@ class DwaqAggregator(Hydro):
         for p in range(self.nprocs):
             nc=self.open_flowgeom_ds(p)
             if 'FlowElemGlobalNr' in nc:
-                max_gid=max(max_gid, nc.FlowElemGlobalNr[:].max() )
+                max_gid=max(max_gid, nc.FlowElemGlobalNr.values.max() )
+            #elif 'mesh2d_face_global_number' in nc:
+            #    max_gid=max(max_gid, nc.mesh2d_face_global_number.values.max() )
             elif self.nprocs==1:
                 max_gid=len(nc['nFlowElem'])
             else:
                 raise Exception("Need global element numbers for multi-processor run")
-            max_elts_2d_per_proc=max(max_elts_2d_per_proc,len(nc['nFlowElem']))
-            max_lnks_2d_per_proc=max(max_lnks_2d_per_proc,len(nc['nFlowLink']))
-            # nc.close() # now we cache this
+            if 'nFlowElem' in nc.dims:
+                ncell='nFlowElem'
+            elif 'nmesh2d_face' in nc.dims:
+                ncell='nmesh2d_face'
+            else:
+                raise Exception("Could't find face dimension")
+            max_elts_2d_per_proc=max(max_elts_2d_per_proc,len(nc[ncell]))
+            if 'nFlowLink' in nc.dims:
+                nlinks_here=len(nc['nFlowLink'])
+            elif 'mesh2d_face_links' in nc:
+                nlinks_here=nc['mesh2d_face_links'].max()
+            elif 'nmesh2d_edge' in nc.dims:
+                # missing link info may be a problem later, but at the moment we just need
+                # an upper bound
+                self.log.warning("No Link information in waqgeom, so will estimate max by number of edges")
+                nlinks_here=nc.dims['nmesh2d_edge']
+            else:
+                raise Exception("Couldn't find link dimension")
+            max_lnks_2d_per_proc=max(max_lnks_2d_per_proc,nlinks_here)
+            # no nc.close(), as it is now cached
 
         n_global_elements=int(max_gid) # ids should be 1-based, so this is also the count
 
@@ -2588,20 +2951,22 @@ class DwaqAggregator(Hydro):
             self.log.info("init_elt_mapping: proc=%d"%p)
             # used to use circumcenters, but that can be problematic
             nc=self.open_flowgeom_ds(p)
-            try:
+            if 'FlowElem_zcc' in nc:
                 # typically positive down
                 ccz=nc.FlowElem_zcc[:].values
-            except AttributeError:
+            elif 'FlowElem_bl' in nc:
                 # typically positive up, negate to be consistent with FlowElem_zcc
                 ccz=-nc.FlowElem_bl[:].values
+            else:
+                raise Exception("flowgeom does not have cell depths.  Maybe there is DFM map output that we didn't find?")
                 
             ncg=dfm_grid.DFMGrid(nc)
             g_centroids=ncg.cells_centroid()
             ccx=g_centroids[:,0]
             ccy=g_centroids[:,1]
 
-            dom_id=nc.FlowElemDomain.values
-            global_ids=nc.FlowElemGlobalNr.values - 1  # make 0-based
+            dom_id=nc.FlowElemDomain.values.astype(np.int32)
+            global_ids=(nc.FlowElemGlobalNr.values - 1).astype(np.int32)  # make 0-based
 
             try:
                 areas=nc.FlowElem_bac.values
@@ -2646,7 +3011,10 @@ class DwaqAggregator(Hydro):
 
         if (not self.merge_only) and self.nudge_elements:
             global_remapped={} # global id => nudged element.
-            agg_g=unstructured_grid.UnstructuredGrid.from_shp(self.agg_shp)
+            if isinstance(self.agg_shp,unstructured_grid.UnstructuredGrid):
+                agg_g=self.agg_shp
+            else:
+                agg_g=unstructured_grid.UnstructuredGrid.from_shp(self.agg_shp)
             
             for nudge_iter in range(5):
                 nudge_count=0
@@ -2887,7 +3255,11 @@ class DwaqAggregator(Hydro):
             elem_dom_id=nc.FlowElemDomain.values # domains are numbered from 0
 
             if self.link_ownership=="FlowLinkDomain":
-                link_dom_id=nc.FlowLinkDomain.values
+                if p==0 and 'FlowLinkDomain' not in nc:
+                    self.log.warning("FlowLinkDomain not found, so link ownership will use min element")
+                    self.link_ownership="owner_of_min_elem"
+                else:
+                    link_dom_id=nc.FlowLinkDomain.values
             else:
                 # otherwise, don't even load it.  probably means we can't trust it.
                 pass 
@@ -2907,7 +3279,15 @@ class DwaqAggregator(Hydro):
             # on order, but only for the top layer?
             # should be...
 
-            links=nc.FlowLink.values # 1-based
+            # hmm - with ugrid output do not necessarily have link variable.
+            if 'FlowLink' in nc:
+                links=nc.FlowLink.values # 1-based
+            else:
+                self.log.warning("Danger: faking missing link data with edges")
+                # These are 1-based, with closed, non-computational neighbors
+                # ==0
+                links=nc.mesh2d_edge_faces.values.astype(np.int32)
+            
             def local_elts_to_link(from_2d,to_2d):
                 # slow - have to lookup the link
                 sela=(links[:,0]==from_2d)&(links[:,1]==to_2d)
@@ -2966,7 +3346,6 @@ class DwaqAggregator(Hydro):
                             pass
                         else:
                             # Ownership is not clear
-
                             if self.link_ownership=="FlowLinkDomain":
                                 # trust subdomain FlowLinkDomain to resolve ownership
                                 link_idx=local_elts_to_link(from_2d,to_2d)
@@ -3828,17 +4207,23 @@ class DwaqAggregator(Hydro):
             flows += Eflow.dot(p_flow)
         return flows
 
-    def segment_aggregator(self,t_sec,seg_fn,normalize=True,min_volume=0.00001):
+    def segment_aggregator(self,t_sec,seg_fn,normalize=True,min_volume=0.00001,
+                           nan_method='pass'):
         """ 
         Generic segment scalar aggregation
         t_sec: simulation time, integer seconds
-        seg_fn: lambda proc => scalar for each unaggregated segment
+        seg_fn: lambda proc => scalar for each unaggregated segment.  If this is a single
+        processor run, it's okay to pass the array directly.
+
         normalize: if True, divide by aggregated volume, otherwise just sum
         min_volume: if normalizing by volume, this volume is added, so that zero-volume
         inputs with valid scalars will produce valid output.  Note that this included 
         for all unaggregated segments - in cases where there are large numbers of 
         empty segments aggregated with a few small non-empty segments, then there will
         be some error.  but min_volume can be very small
+
+        nan_method: 'pass' does no special handling of nan in scalar. 'ignore' will
+          zero out the scalar and volume for segments with a nan scalar.
         """
         # volume-weighted averaging
         agg_scalars=np.zeros(self.n_seg,'f4')
@@ -3853,10 +4238,19 @@ class DwaqAggregator(Hydro):
             vols=hydp.volumes(t_sec)
             if min_volume>0:
                 vols=vols.clip(min_volume,np.inf)
-            scals=seg_fn(p) * np.ones_like(vols) # mult in case seg_fn returns a scalar
+
+            if self.nprocs==1 and not callable(seg_fn):
+                scals=seg_fn
+            else:
+                scals=seg_fn(p)
+            scals=scals * np.ones_like(vols) # mult in case seg_fn returns a scalar
 
             # inner loop on target segment
             S=self.seg_matrix[p]
+            if nan_method=='ignore':
+                invalid=np.isnan(scals)
+                vols=np.where( invalid, 0, vols)
+                scals=np.where( invalid, 0, scals)
             agg_scalars += S.dot( vols*scals )
             agg_volumes += S.dot( vols )
 
@@ -4111,27 +4505,23 @@ class DwaqAggregator(Hydro):
 
     def add_parameters(self,hparams):
         hparams=super(DwaqAggregator,self).add_parameters(hparams)
-        
         hyd0=self.open_hyd(0)
-        # 2017-01-5: used to call temperature 'temperature', but for dwaq it should
-        #            be temp.
 
         # new approach - use unaggregated parameter objects.
         hyd0_params=hyd0.parameters(force=False)
 
-        # could also loop over the parameters that hyd0 has, and just be sure
-        # step over the ones that will be replaced, like surf.
-
-        for pname in ['VertDisper','salinity','temp']:
-            # see if the first processor has it
-            if pname in hyd0_params:
-                hyd0_param=hyd0_params[pname]
-                # in the past, used the label to grab this from each unaggregated
-                # source.
-                # now we use the parameter name
-                hparams[pname]=ParameterSpatioTemporal(func_t=self.seg_func(param_name=pname),
-                                                       times=hyd0_param.times,
-                                                       hydro=self)
+        for pname in hyd0_params:
+            if pname.lower() in ['surf','bottomdept']:
+                self.log.info("Original hydro has parameter %s, but it will not be copied to aggregated"%pname)
+                continue
+            
+            hyd0_param=hyd0_params[pname]
+            # in the past, used the label to grab this from each unaggregated
+            # source.
+            # now we use the parameter name
+            hparams[pname]=ParameterSpatioTemporal(func_t=self.seg_func(param_name=pname),
+                                                   times=hyd0_param.times,
+                                                   hydro=self)
 
         return hparams
 
@@ -4173,7 +4563,12 @@ class DwaqAggregator(Hydro):
             temp_file="'%s-temp.seg'"%name
         else:
             temp_file='none'
-            
+
+        if 'tau' in self.parameters():
+            tau_file="'%s-tau.seg'"%name
+        else:
+            tau_file='none'
+
         lines=[
             "file-created-by  SFEI, waq_scenario.py",
             "file-creation-date  %s"%( datetime.datetime.utcnow().strftime('%H:%M:%S, %d-%m-%Y') ),
@@ -4216,7 +4611,7 @@ class DwaqAggregator(Hydro):
             "vert-diffusion-file   '%s-vertdisper.seg'"%name,
             # not a segment function!
             "surfaces-file         '%s'"%self.surf_filename,
-            "shear-stresses-file   none",
+            "shear-stresses-file   %s"%tau_file,
             "hydrodynamic-layers",
             "\n".join( ["%.5f"%(1./n_layers)] * n_layers ),
             "end-hydrodynamic-layers",
@@ -4419,14 +4814,6 @@ class DwaqAggregator(Hydro):
             ds[layers]=xr.DataArray(sub[layers].values,
                                     dims=[layers],
                                     attrs=attrs)
-            # maybe some kind of xarray bug?  the data array appears fine, but when it
-            # makes it to the dataset, it's all nan.
-            # changing the name of the ending variable makes no difference
-            # changing the name of the dimension does fix it.
-            # work around is to give it a different dimension name.  kludge. FIX.
-            #ds['nFlowMesh_layers_bnds']=xr.DataArray(sub.nFlowMesh_layers_bnds[:].copy(),
-            #                                         dims=['nFlowMesh_layers2','d2'])
-
             # this syntax works better:
             if layer_bnds in sub:
                 ds[layer_bnds]=( [layers,'d2'],
@@ -4454,11 +4841,9 @@ class DwaqAggregator(Hydro):
         """
         populate self.bnd, same format as read_bnd()
         but based on pulling the names from the subdomains.
-
         Note that this was originally developed in MultiAggregator, but is now
         being adapted for more general use.  The original MultiAggregator
         implementation is included in that class
-
         Note that if BCs are *not* aggregated, the data returned here can have
         multiple boundary entries for the same x coordinate / coordinates
         """
@@ -4481,6 +4866,8 @@ class DwaqAggregator(Hydro):
         bc_links= flow_link_outside>nFlowElem
         flow_link_outside[bc_links] = nFlowElem - flow_link_outside[bc_links]
 
+        self.infer_2d_links()
+        
         # iterate over bnds from each subdomain
         for proc in range(self.nprocs):
             sub_hyd=self.open_hyd(proc)
@@ -4511,7 +4898,7 @@ class DwaqAggregator(Hydro):
                     # Can we now get back to the local link this belongs to?
                     # Then go from that local link to an aggregated link
                     if np.all( x[0] == x[1] ):
-                        # print("Vertical/source entry")
+                        self.log.warning("Vertical/source entry - this is probably outdated code")
                         # Would like figure out which entry in FlowLink to point to
                         # the aggregated output includes these source links in FlowLink
                         # but the source domains do not
@@ -4520,6 +4907,23 @@ class DwaqAggregator(Hydro):
                         x0=x[0]
                         elt_inside=sub_g.select_cells_nearest(x[0],inside=True)
                         elt_outside=None # subdomains don't have these in FlowLink
+
+                        # RH 2019-09-10: this stanza is new. previously, there was a bug
+                        # here as this if clause did not set link1, which was then used
+                        # below. when reading spliced hydro for a second aggregation step,
+                        # it was failing, but it appeared that sub_geom.FlowLink 
+                        # actually had all the data, and could have been matched to bc_elt_pos+1.
+                        # so try that, but it's possible it will break again when splicing.
+                        link1,fromto=np.nonzero( sub_geom.FlowLink.values==bc_elt_pos+1)
+                        if len(link1)!=1:
+                            print("Trouble finding the FlowLink which goes with this [src] bc element")
+                            print("  link1: %s"%link1)
+                        link1=link1[0]
+                        fromto=fromto[0]
+                        # if all is well, elt_inside from above should match with what's in FlowLink.
+                        # I don't think elt_outside really matters
+                        assert sub_geom.FlowLink.values[link1,1-fromto]-1 == elt_inside,"Sanity comparison on source element failed"
+                        
                     else:
                         # print("Horizontal bnd entry")
                         link1,fromto=np.nonzero( sub_geom.FlowLink.values==bc_elt_pos+1)
@@ -4550,22 +4954,57 @@ class DwaqAggregator(Hydro):
                     # this element is within the aggregation
 
                     # elt_agg is 0-based
+                    # This is probably a source of problems -- we match too broadly here, ignoring
+                    # the value of flow_link_outside, and lumping together all links that are
+                    # boundary and match on interior element -- and then below we disregard
+                    # additional matches.
                     bc_flow_links=np.nonzero( (flow_link_inside==elt_agg+1) & (flow_link_outside<0) )[0]
+
+                    # to solve this multiple mapping problem, go through the exchanges
+                    if 1: # trying
+                        # This is a sanity check
+                        assert sub_hyd.links[link1,1-fromto]==elt_inside,"links in flowgeom may not be same as sub_hyd.links"
+                        assert not self.agg_boundaries,"This code only makes sense with unaggregated boundaries"
+                        # which exchanges are involved in the unaggregated grid?
+                        sub_link_exchs=np.nonzero( sub_hyd.exch_to_2d_link['link']==link1 )[0]
+                        # just trace the first one:
+                        sub_link_exch=sub_link_exchs[0] 
+                        # what aggregated exchange does it map to?
+                        agg_link_exch=self.exch_local['agg'][proc,sub_link_exch]
+                        agg_link=self.exch_to_2d_link[agg_link_exch]
+                        assert agg_link['sgn']==1,"Expecting no sign flips for bc links"
+                        bc_flow_link=agg_link['link']
+                        assert bc_flow_link in bc_flow_links,"Validation against old approach failed"
+                        bc_flow_links=np.array([bc_flow_link])
+                    
                     # Used to assert this was a unique match
-                    if 0:
+                    if 1: # this is probably better -- at least when not aggregating boundaries
                         assert len(bc_flow_links)==1
                         bc_id=flow_link_outside[bc_flow_links[0]]
                         bc_names[bc_id]=name
                         bc_x[bc_id].append(x)
                     else:
+                        if len(bc_flow_links)!=1:
+                            #import pdb
+                            #pdb.set_trace()
+                            print("Matching bc links expected 1 match, but elt_agg=%d, name=%s matched %s"%
+                                  (elt_agg,name,bc_flow_links))
+
                         # Now allow multiple -- may cause problems with writing them out, though.
                         for bc_flow_link in bc_flow_links:
                             bc_id=flow_link_outside[bc_flow_links[0]]
                             if bc_id in bc_names:
+                                # 2018-12-12: increase verbosity during test
+                                print("bc_id %d already mapped to %s, would have mapped to %s"%
+                                      (bc_id,bc_names[bc_id],name))
+                                #import pdb
+                                #pdb.set_trace()
                                 continue
                             bc_names[bc_id]=name
                             bc_x[bc_id].append(x) # Will have to deal with this x not being unique!
-                            break
+                            # break # 2018-12-12 makes me nervous
+                            # this seems wrong -- if we match multiple flow links, that probably means
+                            # that the matching code above is too broad.
 
         # Reverse that mapping
         bc_ids_for_name=defaultdict(list)
@@ -4626,13 +5065,16 @@ class HydroAggregator(DwaqAggregator):
 
     def grid(self):
         if self.agg_shp is not None:
-            g=unstructured_grid.UnstructuredGrid.from_shp(self.agg_shp)
-            self.log.info("Inferring grid from aggregation shapefile")
-            #NB: the edges here do *not* line up with links of the hydro.
-            # at some point it may be possible to adjust the aggregation
-            # shapefile to make these line up.
-            g.make_edges_from_cells()
-            return g
+            if isinstance(self.agg_shp,unstructured_grid.UnstructuredGrid):
+                return self.agg_shp
+            else:
+                g=unstructured_grid.UnstructuredGrid.from_shp(self.agg_shp)
+                self.log.info("Inferring grid from aggregation shapefile")
+                #NB: the edges here do *not* line up with links of the hydro.
+                # at some point it may be possible to adjust the aggregation
+                # shapefile to make these line up.
+                g.make_edges_from_cells()
+                return g
         else:
             return self.hydro_in.grid()
     
@@ -4730,9 +5172,17 @@ class HydroAggregator(DwaqAggregator):
             # Maybe this should move out to a more general purpose location??
             link_global_to_agg=np.zeros(self.hydro_in.n_2d_links,'i4')-1
 
+            # build hash table to accelerate the lookup below
+            agg_exch_to_locals=defaultdict(list)
+            # iterate over the local exchanges, here just proc 0
+            for unagg_exch,agg in enumerate(self.exch_local['agg'][0]):
+                agg_exch_to_locals[ agg ].append(unagg_exch)
+                
             for exch_i,(a,b,_,_) in enumerate(poi0[:self.n_exch_x+self.n_exch_y]):
                 # probably have to speed this up with some hashing
-                my_unagg_exchs=np.nonzero(self.exch_local['agg'][0,:]==exch_i)[0]
+                # my_unagg_exchs=np.nonzero(self.exch_local['agg'][0,:]==exch_i)[0]
+                my_unagg_exchs=np.array(agg_exch_to_locals[exch_i])
+                
                 # this is [ (link, sgn), ... ]
                 my_unagg_links=self.hydro_in.exch_to_2d_link[my_unagg_exchs]
                 if a>=0:
@@ -4903,12 +5353,24 @@ class HydroMultiAggregator(DwaqAggregator):
             self._hyds[p]=HydroFiles(os.path.join(self.sub_dir(p),
                                                   "%s_%04d.hyd"%(self.run_prefix,p)))
         return self._hyds[p]
+    
+    def dfm_map_file(self,p):
+        """
+        Try to infer the name of the dfm map output for processor p, and
+        if it exists, return that path
+        """
+        map_fn=os.path.join(self.path,"DFM_OUTPUT_%s"%self.run_prefix,"%s_%04d_map.nc"%(self.run_prefix,p))
+        if os.path.exists(map_fn):
+            return map_fn
+        else:
+            return None
 
     def infer_nprocs(self):
         max_nprocs=1024
         for p in range(1+max_nprocs):
             if not os.path.exists(self.sub_dir(p)):
-                assert p>0
+                if p==0:
+                    raise WaqException("Failed to find any subdomains -- may be a serial run")
                 return p
         else:
             raise Exception("Really - there are more than %d subdomains?"%max_nprocs)
@@ -4972,7 +5434,8 @@ class HydroMultiAggregator(DwaqAggregator):
                         # the aggregated output includes these source links in FlowLink
                         # but the source domains do not
                         # Can it be found based on coordinate?
-                        # Not an exact match.
+                        # Not an exact match. Note that some changes in this stanza were made
+                        # above in the HydroAggregator code.
                         x0=x[0]
                         elt_inside=sub_g.select_cells_nearest(x[0],inside=True)
                         elt_outside=None # subdomains don't have these in FlowLink
@@ -5117,7 +5580,22 @@ class FilterHydroBC(Hydro):
     Subclass of Hydro which shifts tidal fluxes into changing volumes, with
     only subtidal fluxes.
     """
-    def __init__(self,original,lp_secs=86400*36./24,selection='boundary'):
+    lp_secs=86400*36./24
+    selection='boundary'
+
+    # for large inputs, use memmap.
+    # apply_filter() will create temporary files, and put the names
+    # here.  then write*() can just move these files.
+    use_memmap=True
+    tmp_flo_fn=None
+    tmp_vol_fn=None
+    tmp_are_fn=None
+    # the corresponding mmap objects
+    new_flo_mmap=None
+    new_vol_mmap=None
+    new_are_mmap=None
+    
+    def __init__(self,original,**kws):
         """
         selection: which exchanges will be filtered.  
            'boundary': only open boundaries
@@ -5125,10 +5603,9 @@ class FilterHydroBC(Hydro):
            bool array: length Nexchanges, with True meaning it will get filtered.
            int array:  indices of exchanges to be filtered.
         """
-        super(FilterHydroBC,self).__init__()
         self.orig=original
-        self.selection=selection
-        self.lp_secs=float(lp_secs)
+        super(FilterHydroBC,self).__init__(**kws)
+        self.lp_secs=float(self.lp_secs) # just to be sure
         self.apply_filter()
 
     # awkward handling of scenario - it gets set by the scenario, so we have
@@ -5168,6 +5645,10 @@ class FilterHydroBC(Hydro):
     bnd_filename = forwardTo('orig','bnd_filename')
     write_boundary_links = forwardTo('orig','write_boundary_links')
 
+    # butter: Butterworth filter.  Good frequency response, but can have some overshoots
+    #  when cells dry up, leading to negative volume.
+    filter_type='butter' # or 'fir'
+
     _pad=None
     @property
     def pad(self):
@@ -5184,24 +5665,75 @@ class FilterHydroBC(Hydro):
         return self._dt
             
     def lowpass(self,data):
-        pad =self.pad
-        npad=len(pad)
-        
-        flow_padded=np.concatenate( ( pad, 
-                                      data,
-                                      pad) )
-        lp_flows=filters.lowpass(flow_padded,
-                                 cutoff=self.lp_secs,dt=self.dt)
-        lp_flows=lp_flows[npad:-npad] # trim the pad
+        if self.filter_type=='butter':
+            # For butterworth pad out the ends
+            pad =self.pad
+            npad=len(pad)
+
+            flow_padded=np.concatenate( ( pad, 
+                                          data,
+                                          pad) )
+            lp_flows=filters.lowpass(flow_padded,
+                                     cutoff=self.lp_secs,dt=self.dt)
+            lp_flows=lp_flows[npad:-npad] # trim the pad
+        elif self.filter_type=='fir':
+            # try no padding here
+            lp_flows=filters.lowpass_fir(data,winsize=int(self.lp_secs/self.dt))
+        else:
+            raise Exception('Bad filter type: %s'%self.filter_type)
         return lp_flows
-    
+
     def apply_filter(self):
-        self.filt_volumes=np.array( [self.orig.volumes(t) for t in self.orig.t_secs] )
-        self.filt_flows  =np.array( [self.orig.flows(t)   for t in self.orig.t_secs] )
-        self.filt_areas  =np.array( [self.orig.areas(t)   for t in self.orig.t_secs] )
-        self.orig_volumes=self.filt_volumes.copy()
-        self.orig_flows  =self.filt_flows.copy()
-        
+        """
+        Filters all of the hydro information.  Note that this is not smart about
+        loading only a small part of the data, and thus won't work when
+        applied to a large dataset.  Better to aggregate some and
+        then apply the lowpass.
+        """
+        if self.use_memmap:
+            # for this to work, the source data needs to be sitting on disk where
+            # it can be memory-mapped.
+            # would be better to make this part of HydroFiles
+            assert isinstance(self.orig,HydroFiles),"Memmap only works with HydroFiles"
+            flo_fn=self.orig.get_path('flows-file')
+            flo_mmap=np.memmap(flo_fn, self.orig.flo_dtype(), mode='r')
+            vol_fn=self.orig.get_path('volumes-file')
+            vol_mmap=np.memmap(vol_fn, self.orig.vol_dtype(), mode='r')
+            are_fn=self.orig.get_path('areas-file')
+            are_mmap=np.memmap(are_fn, self.orig.are_dtype(), mode='r')
+
+            self.orig_volumes=vol_mmap['volume']
+            self.orig_flows  =flo_mmap['flow']
+            self.orig_areas  =are_mmap['area']
+
+            # To modify these, have to create new file
+            self.tmp_flo_fn="tmp.flo"
+            self.tmp_vol_fn="tmp.vol"
+            self.tmp_are_fn="tmp.are"
+
+            self.log.info("Copying flo file")
+            shutil.copyfile(flo_fn,self.tmp_flo_fn)
+            self.log.info("Copying vol file")
+            shutil.copyfile(vol_fn,self.tmp_vol_fn)
+            self.log.info("Copying are file") # eventually gets modified
+            shutil.copyfile(are_fn,self.tmp_are_fn)
+
+            self.new_flo_mmap=np.memmap(self.tmp_flo_fn, self.flo_dtype(), mode='r+')
+            self.filt_flows=self.new_flo_mmap['flow']
+
+            self.new_vol_mmap=np.memmap(self.tmp_vol_fn, self.vol_dtype(), mode='r+')
+            self.filt_volumes=self.new_vol_mmap['volume']
+
+            self.new_are_mmap=np.memmap(self.tmp_are_fn, self.are_dtype(), mode='r+')
+            self.filt_areas =self.new_are_mmap['area']
+        else:
+            # old way - uses tons of RAM.  all of the RAM.
+            self.filt_volumes=np.array( [self.orig.volumes(t) for t in self.orig.t_secs] )
+            self.filt_flows  =np.array( [self.orig.flows(t)   for t in self.orig.t_secs] )
+            self.filt_areas  =np.array( [self.orig.areas(t)   for t in self.orig.t_secs] )
+            self.orig_volumes=self.filt_volumes.copy()
+            self.orig_flows  =self.filt_flows.copy()
+
         dt=np.median(np.diff(self.t_secs))
         pointers=self.pointers
 
@@ -5211,7 +5743,7 @@ class FilterHydroBC(Hydro):
         # out with 0s:
         # npad=int(5*self.lp_secs / dt)
         
-        for j in self.exchanges_to_filter():
+        for j in utils.progress(self.exchanges_to_filter()):
             # j: index into self.pointers.  
             segA,segB=pointers[j,:2]
 
@@ -5251,6 +5783,11 @@ class FilterHydroBC(Hydro):
     # actually, well, it may be that planform_areas must be positive, but exchange
     # areas can be zero.  Since those are closely linked, it's easiest and doesn't 
     # seem to break anything to enforce a min_area here.
+
+    # If true, volumes which go negative and have no boundary exchange to adjust
+    # will just get their volume increased by whatever amount necessary to be
+    # non-negative over time.
+    force_min_volume=True
     def adjust_negative_volumes(self):
         has_negative=np.nonzero( np.any(self.filt_volumes<self.min_volume,axis=0 ) )[0]
         dt=np.median(np.diff(self.t_secs))
@@ -5262,6 +5799,12 @@ class FilterHydroBC(Hydro):
             if len(bc_exchs)==0:
                 # will lead to a failure 
                 self.log.warning("Segment with negative volume has no boundary exchanges")
+                if self.force_min_volume:
+                    V_add=self.min_volume-self.filt_volumes[:,seg].min()
+                    self.log.warning("Forcing minimum volume. Adding %.3e  Original volumes max: %.3e, mean %.3e"%
+                                     (V_add, self.orig_volumes[:,seg].max(),self.orig_volumes[:,seg].mean()))
+                    self.filt_volumes[:,seg]+=V_add
+                
                 continue
             elif len(bc_exchs)>1:
                 self.log.info("Segment with negative volume has multiple BC exchanges.  Choosing the first")
@@ -5442,13 +5985,42 @@ class FilterHydroBC(Hydro):
         self.orig.infer_2d_links()
         self.n_2d_links=self.orig.n_2d_links
         self.exch_to_2d_link=self.orig.exch_to_2d_link
-        self.links=self.orig.links 
+        self.links=self.orig.links
 
+    # overload these in the case of memory mapped files
+    def write_flo(self):
+        self.copy_mmap_or_delegate("tmp_flo_fn","new_flo_mmap",
+                                   super(FilterHydroBC,self).write_flo,
+                                   self.flo_filename)
+    def write_vol(self):
+        self.copy_mmap_or_delegate("tmp_vol_fn","new_vol_mmap",
+                                   super(FilterHydroBC,self).write_vol,
+                                   self.vol_filename)
+    def write_are(self):
+        self.copy_mmap_or_delegate("tmp_are_fn","new_are_mmap",
+                                   super(FilterHydroBC,self).write_are,
+                                   self.are_filename)
 
+    def copy_mmap_or_delegate(self,fn_attr,mmap_attr,deleg,new_fn):
+        tmp_fn=getattr(self,fn_attr)
+        if self.use_memmap and tmp_fn is not None:
+            assert os.path.exists(tmp_fn),"Hmm - should have memory mapped but %s is not there"%tmp_fn
+            delattr(self,mmap_attr)
+            setattr(self,mmap_attr,None)
+            os.rename(tmp_fn,new_fn)
+            return
+        self.log.warning("Filter Hydro could not simply rename mapped file")
+        # Make it easier to catch this condition while developing
+        raise Exception("During testing this shouldn't happen")
+        deleg()
+        
 class FilterAll(FilterHydroBC):
     """ Minor specialization when you want filter everything - i.e. turn a tidal
     run into a subtidal run.
     """
+    # In the past parameter were always filtered (opposite of what I thought).
+    # that can be disabled here.
+    filter_parameters=True
     
     def __init__(self,original,**kw):
         super(FilterAll,self).__init__(original,selection='all',**kw)
@@ -5525,15 +6097,19 @@ class FilterAll(FilterHydroBC):
                 self.log.info('  parameter already set')
                 continue
             elif isinstance(param,ParameterSpatioTemporal):
-                self.log.info("  original parameter is spatiotemporal - let's FILTER")
-                hyd[key]=param.lowpass(self.lp_secs)
-                if key in ['vertdisper']: # force non-negative
-                    # a bit dangerous, since there is no guarantee that lowpass made a copy.
-                    # but if it didn't make a copy, and all of the source data were
-                    # valid, then there should be nothing to clip.
-                    hyd[key].values = hyd[key].values.clip(0,np.inf)
-                hyd[key].hydro=self
-                self.log.info("  FILTERED.")
+                if self.filter_parameters:
+                    self.log.info("  original parameter is spatiotemporal - let's FILTER")
+                    hyd[key]=param.lowpass(self.lp_secs)
+                    if key in ['vertdisper','tau','salinity']: # force non-negative
+                        # a bit dangerous, since there is no guarantee that lowpass made a copy.
+                        # but if it didn't make a copy, and all of the source data were
+                        # valid, then there should be nothing to clip.
+                        hyd[key].values = hyd[key].values.clip(0,np.inf)
+                    hyd[key].hydro=self
+                    self.log.info("  FILTERED.")
+                else:
+                    self.log.info("  original parameter is spatiotemporal - but filter_parameters=%s.  no filter"%self.filter_parameters)
+                    hyd[key]=param
             elif isinstance(param,ParameterTemporal):
                 self.log.warning("  original parameter is temporal - should filter")
                 hyd[key]=param # FIX - copy and set hydro, maybe filter, too.
@@ -6080,7 +6656,10 @@ class Substance(object):
 
     def __init__(self,initial=None,name=None,scenario=None,active=True):
         self.name = name or "unnamed"
-        self.initial=initial or Initial(default=0.0)
+        if initial is None:
+            self.initial=Initial(default=0.0)
+        else:
+            self.initial=Initial.from_user(initial)
         self.scenario=scenario
         self.active=active
         self.initial.scenario=scenario
@@ -6130,6 +6709,20 @@ class Initial(object):
     # what is the soonest that we know about hydro geometry?
     # the substances know the scenario, but that's before 
 
+    @staticmethod
+    def from_user(v):
+        """
+        When an initial condition is passed to a substance, this method takes 
+        care of turning that into an instance of Initial.
+        """
+        if isinstance(v,Initial):
+            return v
+        elif isinstance(v,np.ndarray):
+            return Initial(seg_values=v)
+        elif np.isscalar(v):
+            return Initial(default=v)
+        else:
+            raise Exception("Not sure how to interpret initial value '%s'"%v)
 
 class ModelForcing(object):
     """ 
@@ -6536,7 +7129,7 @@ class ParameterSpatioTemporal(Parameter):
     interpolation='LINEAR' # or 'BLOCK'
 
     def __init__(self,times=None,values=None,func_t=None,scenario=None,name=None,
-                 seg_func_file=None,enable_write_symlink=False,n_seg=None,
+                 seg_func_file=None,enable_write_symlink=None,n_seg=None,
                  hydro=None):
         """
         times: [N] sized array, 'i4', giving times in system clock units
@@ -6563,7 +7156,15 @@ class ParameterSpatioTemporal(Parameter):
         self._times=times
         self.values=values
         self.seg_func_file=seg_func_file
-        self.enable_write_symlink=enable_write_symlink
+        # generally follow hydro on whether to use symlinks, but allow
+        # an explicit option, too.
+        if enable_write_symlink is None:
+            if hydro is not None:
+                self.enable_write_symlink=hydro.enable_write_symlink
+            else:
+                self.enable_write_symlink=False
+        else:
+            self.enable_write_symlink=enable_write_symlink
         self._n_seg=n_seg # only needed for evaluate() when scenario isn't set
 
     # goofy helpers when n_seg or times can only be inferred after instantiation
@@ -6580,14 +7181,7 @@ class ParameterSpatioTemporal(Parameter):
     @property
     def times(self):
         if (self._times is None) and (self.seg_func_file is not None):
-            stride=4+self.n_seg*4
-            nbytes=os.stat(self.seg_func_file).st_size
-            frames=nbytes//stride
-            self._times=np.zeros(frames,'i4')
-            with open(self.seg_func_file,'rb') as fp:
-                for ti in range(frames):
-                    fp.seek(stride*ti)
-                    self._times[ti]=np.fromstring(fp.read(4),'i4')
+            self.load_from_segment_file()
         return self._times
 
     @property
@@ -6605,10 +7199,17 @@ class ParameterSpatioTemporal(Parameter):
                 " ALL BINARY_FILE '{self.supporting_file}'").format(self=self)
     def write_supporting_try_symlink(self):
         if self.seg_func_file is not None:
+            dst=self.supporting_path
+            if os.path.lexists(dst):
+                if self.scenario.overwrite:
+                    os.unlink(dst)
+                else:
+                    raise Exception("%s exists, and scenario.overwrite is False"%dst)
+                
             if self.enable_write_symlink:
-                rel_symlink(self.seg_func_file,self.supporting_path)
+                rel_symlink(self.seg_func_file,dst)
             else:
-                shutil.copyfile(self.seg_func_file,self.supporting_path)
+                shutil.copyfile(self.seg_func_file,dst)
             return True
         else:
             return False
@@ -6628,19 +7229,19 @@ class ParameterSpatioTemporal(Parameter):
         start_i=max(0,start_i-1)
         stop_i =min(stop_i+1,len(tidxs))
         tidxs=tidxs[start_i:stop_i]
-        msg="write_supporting: only writing %d of %d timesteps. what a savings!"%(len(tidxs),
-                                                                                  len(self.times))
+        msg="write_supporting: writing %d of %d timesteps."%(len(tidxs),
+                                                             len(self.times))
         self.scenario.log.info(msg)
 
         # This is split out so that the parallel implementation can jump in just at this
         # point
         with open(target,'wb') as fp:
-            self.write_supporting_loop(tidxs,fp)
+            self.write_supporting_loop(tidxs,fp,name=target)
 
-    def write_supporting_loop(self,tidxs,fp):
+    def write_supporting_loop(self,tidxs,fp,name='n/a'):
         t_secs=self.times.astype('i4')
         
-        for tidx in tidxs:
+        for tidx in utils.progress(tidxs,msg=name+": %s"):
             t=t_secs[tidx]
             fp.write(t_secs[tidx].tobytes())
             if self.values is not None:
@@ -6649,25 +7250,26 @@ class ParameterSpatioTemporal(Parameter):
                 values=self.func_t(t)
             fp.write(values.astype('f4').tobytes())
 
+    def load_from_segment_file(self):
+        """
+        Set self.values and self._times from the segment function file.
+        This uses memmap, so it should be fairly efficient and safe to
+        do even when you only want a fraction of the data.
+        """
+        self._mmap_data=np.memmap(self.seg_func_file,
+                                  dtype=[('t',np.int32),
+                                         ('value',np.float32,self.n_seg)])
+        self._times=self._mmap_data['t']
+        self.values=self._mmap_data['value']
+
     def evaluate(self,**kws):
         # This implementation is pretty rough - 
         # this class is really a mix of
         # ParameterSpatial and ParameterTemporal, yet it duplicates
         # the code from both of those here.
 
-        if self.seg_func_file is not None:
-            if 't' in kws:
-                t=kws.pop('t')
-                stride=4+self.n_seg*4
-                ti=np.searchsorted(self.times[:-1],t)
-                if self.times[ti]!=t:
-                    print("Mismatch in seg func: request=%s  file=%s"%(t,self.times[ti]))
-                with open(self.seg_func_file,'rb') as fp:
-                    fp.seek(stride*ti+4)
-                    values=np.fromfile(fp,'f4',self.n_seg)
-                    param=ParameterSpatial(values)
-                    return param.evaluate(**kws)
-            return self
+        if (self.seg_func_file is not None) and (self.values is None):
+            self.load_from_segment_file()
                 
         param=self
 
@@ -6675,12 +7277,15 @@ class ParameterSpatioTemporal(Parameter):
             t=kws.pop('t')
             if self.values is not None:
                 tidx=np.searchsorted(self.times,t)
-                param=ParameterSpatial( self.values[tidx,:] )
+                # copy to avoid keeping extra data around too long
+                param=ParameterSpatial( self.values[tidx,:].copy() )
             elif self.func_t is not None:
                 param=ParameterSpatial( self.func_t(t) )
         elif 'seg' in kws:
             seg=kws.pop('seg')
-            param=ParameterTemporal(times=self.times,values=self.values[:,seg])
+            # Copy, since these are much smaller than the original data and
+            # better not to force the original array to stay around.
+            param=ParameterTemporal(times=self.times.copy(),values=self.values[:,seg].copy())
         if param is not self:
             # allow other subclasses to do fancier things
             return param.evaluate(**kws)
@@ -6740,7 +7345,7 @@ class ParameterSpatioTemporal(Parameter):
                 values[:,seg]=-999
             else:
                 lp_values=filters.lowpass(padded,
-                                            cutoff=lp_secs,dt=dt)
+                                          cutoff=lp_secs,dt=dt)
                 values[:,seg]=lp_values[npad:-npad] # trim the pad
         return ParameterSpatioTemporal(times=self.times,
                                        values=values,
@@ -6857,7 +7462,7 @@ class DispArray(object):
     time[i4], [ndisp,nqt] matrix of 'f4' - for each time step.
     nqt is total number of exchanges.
     """
-    def __init__(self,name=None,substances=None,data=None):
+    def __init__(self,name=None,substances=None,data=None,times=None):
         """
         typ. usage:
         scenario.dispersions['subtidal_K']=DispArray(substances='.*',data=xxx)
@@ -6865,7 +7470,12 @@ class DispArray(object):
         name: label for the dispersion array, max len 20 char
         substances: list of substance names or patterns for which this array applies.
           can be a str, which is coerced to [str].  Interpreted as regular expression.
-        data: working on it.
+        Options for data, times:
+          constant in time: data is an array of dispersion coefficients, one per exchange.
+             times is None.
+          unsteady: data is a 2D array, [time,exchange], and times gives corresponding
+             timesteps in system time units, similar to ParameterSpatioTemporal, i.e. seconds since
+             reference time.
         """
         if name is not None:
             self.name=name[:20]
@@ -6875,6 +7485,8 @@ class DispArray(object):
             substances=[substances]
         self.patts=substances
         self.data=data
+        self.times=times
+        
     def matches(self,name):
         for patt in self.patts:
             if re.match(patt,name,flags=re.IGNORECASE):
@@ -6900,9 +7512,13 @@ class DispArray(object):
             # I didn't see this in the docs, but it's true of the 
             # .par files written by the GUI. probably this is to make the format
             # the same as a segment function with a single time step.
-            fp.write(np.array(0,dtype='i4').tobytes())
-            fp.write(self.data.astype('f4').tobytes())
-        
+            if self.times is None:  # Write constant in time.
+                fp.write(np.array(0,dtype='i4').tobytes())
+                fp.write(self.data.astype('f4').tobytes())
+            else:
+                for ti,t in enumerate(self.times):
+                    fp.write(np.array(t,dtype='i4').tobytes())
+                    fp.write(self.data[ti,:].astype('f4').tobytes())
 
 def map_nef_names(nef):
     subst_names=nef['DELWAQ_PARAMS'].getelt('SUBST_NAMES',[0])
@@ -6921,8 +7537,13 @@ def map_nef_names(nef):
     return elt_map,real_map
 
         
-DEFAULT='_DEFAULT_'    
+DEFAULT='_DEFAULT_'
+
 class Scenario(scriptable.Scriptable):
+    """
+    A class wrapper for a Delft D-Water Quality (DWAQ)
+    simulation.
+    """
     name="tbd" # this is used for the basename of the various files.
     desc=('line1','line2','line3')
 
@@ -6930,9 +7551,11 @@ class Scenario(scriptable.Scriptable):
     time0=None
     # time0=datetime.datetime(1990,8,5) # defaults to hydro value
     scu=datetime.timedelta(seconds=1)
-    time_step=None # will be taken from the hydro, unless specified otherwise
+    time_step=None  # these are taken from hydro, unless specified otherwise
+    start_time=None # 
+    stop_time=None  # 
 
-    log=logging # take a stab at managing messages via logging
+    log=logging # python logging 
 
     # backward differencing,
     # .60 => second and third keywords are set 
@@ -6946,10 +7569,15 @@ class Scenario(scriptable.Scriptable):
     grid_output=('SURF','LocalDepth')              # grid topo
     hist_output=(DEFAULT,'SURF','LocalDepth') # history file
     map_output =(DEFAULT,'SURF','LocalDepth')  # map file
+    stat_output =() # default to no stat output
 
     map_formats=['nefis']
     history_formats=['nefis','binary']
 
+    # not fully handled, but generally trying to overwrite
+    # a run without setting this to True should fail.
+    overwrite=False
+    
     # settings related to paths - a little sneaky, to allow for shorthand
     # to select the next non-existing subdirectory by setting base_path to
     # "auto"
@@ -6982,6 +7610,8 @@ class Scenario(scriptable.Scriptable):
     # be ambiguous.
     monitor_transects=()
 
+    # These really shouldn't be this large.  in the update WaqModel they all
+    # default to 0.0, much more sensible.
     base_x_dispersion=1.0 # m2/s
     base_y_dispersion=1.0 # m2/s
     base_z_dispersion=1e-7 # m2/s
@@ -6999,7 +7629,7 @@ class Scenario(scriptable.Scriptable):
     mon_stop_time=None
     mon_time_step=None
 
-    def __init__(self,hydro,**kw):
+    def __init__(self,hydro=None,**kw):
         self.log=logging.getLogger(self.__class__.__name__)
 
         # list of dicts.  moving towards standard setting of loads via src_tags
@@ -7009,11 +7639,7 @@ class Scenario(scriptable.Scriptable):
         self.dispersions=NamedObjects(scenario=self)
         self.velocities=NamedObjects(scenario=self)
 
-        if hydro:
-            print( "Setting hydro")
-            self.set_hydro(hydro)
-        else:
-            self.hydro=None # will have limited functionality
+        self.hydro=hydro
 
         self.inp=InpFile(scenario=self)
 
@@ -7030,6 +7656,7 @@ class Scenario(scriptable.Scriptable):
         if self.hydro is not None:
             self.hydro_parameters=self.init_hydro_parameters()
         self.substances=self.init_substances()
+        assert self.substances is not None, "init_substances() did not return anything."
         self.init_bcs()
         self.init_loads()
 
@@ -7086,17 +7713,34 @@ class Scenario(scriptable.Scriptable):
 END_MULTIGRID"""%num_layers
         else:
             return " ; sigma layers - no multigrid stanza"
-    
-    def set_hydro(self,hydro):
-        self.hydro=hydro
-        self.hydro.scenario=self
 
-        # sensible defaults for simulation period
+    _hydro=None
+    @property
+    def hydro(self):
+        return self._hydro
+    @hydro.setter
+    def hydro(self,value):
+        self.set_hydro(value)
+
+    def set_hydro(self,hydro):
+        self._hydro=hydro
+
+        if hydro is None:
+            return
+
+        self._hydro.scenario=self
+
+        # I think it's required that these match
+        self.time0 = self._hydro.time0
+
+        # Other time-related values needn't match, but the hydro
+        # is a reasonable default if no value has been set yet.
         if self.time_step is None:
-            self.time_step=self.hydro.time_step
-        self.time0 = self.hydro.time0
-        self.start_time=self.time0+self.scu*self.hydro.t_secs[0]
-        self.stop_time =self.time0+self.scu*self.hydro.t_secs[-1]
+            self.time_step=self._hydro.time_step
+        if self.start_time is None:
+            self.start_time=self.time0+self.scu*self._hydro.t_secs[0]
+        if self.stop_time is None:
+            self.stop_time =self.time0+self.scu*self._hydro.t_secs[-1]
 
     def init_parameters(self):
         params=NamedObjects(scenario=self,cast_value=cast_to_parameter)
@@ -7176,7 +7820,17 @@ END_MULTIGRID"""%num_layers
         self.loads.append(load)
         return load
     
-    def add_monitor_from_shp(self,shp_fn,naming='elt_layer'):
+    def add_monitor_from_shp(self,shp_fn,naming='elt_layer',point_layers=True):
+        """
+        For each feature in the shapefile, add a monitor area.
+        shp_fn: path to shapefile
+        naming: generally, a field name from the shapefile giving the name of the monitor area.
+          special case when point_layers is True and the shapefile has points, naming can
+          be "elt_layer" in which case individual segments are monitored separately, and
+          named like elt123_layer45.
+        """
+        assert self.hydro,"Set hydro before calling add_monitor_from_shp"
+
         locations=wkb2shp.shp2geom(shp_fn)
         self.hydro.infer_2d_elements()
 
@@ -7188,11 +7842,8 @@ END_MULTIGRID"""%num_layers
 
         for i,rec in enumerate(locations):
             geom=rec['geom']
-            # for starters, only points are allowed, but it could
-            # be extended to handle lines for transects and polygons
-            # for horizontal integration
 
-            if geom.type=='Point':
+            if point_layers and (geom.type=='Point'):
                 xy=np.array(geom.coords)[0]
                 # would be better to have select_cells_nearest use
                 # centroids instead of circumcenters, but barring
@@ -7208,37 +7859,60 @@ END_MULTIGRID"""%num_layers
                 for layer,seg in enumerate(segs):
                     if naming=='elt_layer':
                         name="elt%d_layer%d"%(elt,layer)
-                        if name not in names:
-                            new_areas.append( (name,[seg] ) )
-                            names[name]=True
-            elif geom.type=='Polygon':
+                    else:
+                        name="%s_layer%d"%(rec[naming],layer)
+                    if name not in names:
+                        new_area=(name,[seg])
+                        self.monitor_areas = self.monitor_areas + (new_area,)
+                        names[name]=True
+                    else:
+                        self.log.warning("Duplicate requests to monitor %s"%name)
+            else:
                 try:
                     name=rec[naming]
                 except:
-                    name="polygon%d"%i
-                    
-                # bitmask over 2D elements
-                self.log.info("Selecting elements in polygon '%s'"%name)
-                # better to go by center, so that non-intersecting polygons
-                # yield non-intersecting sets of elements and segments
-                elt_sel=g.select_cells_intersecting(geom,by_center=True) # few seconds
+                    name="mon%d"%len(self.monitor_areas)
+                self.add_monitor_for_geometry(name=name,geom=geom)
+                
+    def add_monitor_for_geometry(self,name,geom):
+        """
+        Add a monitor area for elements intersecting the shapely geometry geom.
+        """
+        # make sure the name is unique
+        for n,segs in self.monitor_areas:
+            assert name!=n
+        
+        g=self.hydro.grid()
+        # bitmask over 2D elements
+        self.log.info("Selecting elements in polygon '%s'"%name)
+        # better to go by center, so that non-intersecting polygons
+        # yield non-intersecting sets of elements and segments
+        # 2019-09-12: use centroid instead of center in case the grid has weird geometry
+        # 2020-01-31: use representative points. It's possible for centroid not to fall within
+        #      the polygon.  Don't use full polygon, because that will pick up adjacent 
+        #      cells that share an edge.
+        elt_sel=g.select_cells_intersecting(geom,by_center='representative') 
 
-                # extend to segments:
-                seg_sel=elt_sel[ self.hydro.seg_to_2d_element ] & (self.hydro.seg_to_2d_element>=0)         
+        # extend to segments:
+        seg_sel=elt_sel[ self.hydro.seg_to_2d_element ] & (self.hydro.seg_to_2d_element>=0)         
+        segs=np.nonzero( seg_sel )[0]
 
-                segs=np.nonzero( seg_sel )[0]
+        new_area= (name,segs) 
 
-                assert name not in names
-                new_areas.append( (name,segs) )
-                names[name]=True
-            else:
-                self.log.warning("Not ready to handle geometry type %s"%geom.type)
-
-        self.log.info("Added %d monitored segments from %s"%(len(new_areas),shp_fn))
-        self.monitor_areas = self.monitor_areas + tuple(new_areas)
+        self.log.info("Added %d monitored segments for %s"%(len(segs),name))
+        self.monitor_areas = self.monitor_areas + ( new_area, )
 
     def add_transects_from_shp(self,shp_fn,naming='count',clip_to_poly=True,
-                               on_boundary='warn_and_skip'):
+                               on_boundary='warn_and_skip',on_edge=False):
+        """
+        Add monitor transects from a shapefile.
+        By default transects are named in sequence.  
+        Specify a shapefile field name in 'naming' to pull user-specified
+        names for the transects.
+        on_edge: indicates that the shapefile is made up of nodes already following
+          edges of the grid.  In theory not needed, but included here for compatibility
+          with ZZ code.
+        """
         locations=wkb2shp.shp2geom(shp_fn)
         g=self.hydro.grid()
 
@@ -7278,7 +7952,7 @@ END_MULTIGRID"""%num_layers
                     name="transect%04d"%i
                 else:
                     name=rec[naming]
-                exchs=self.hydro.path_to_transect_exchanges(xy,on_boundary=on_boundary)
+                exchs=self.hydro.path_to_transect_exchanges(xy,on_boundary=on_boundary,on_edge=on_edge)
                 new_transects.append( (name,exchs) )
             else:
                 self.log.warning("Not ready to handle geometry type %s"%geom.type)
@@ -7376,9 +8050,9 @@ END_MULTIGRID"""%num_layers
         t can be a datetime object, an integer number of seconds since time0,
         or a floating point datenum
         """
-        if np.issubdtype(type(t),int):
+        if np.issubdtype(type(t),np.integer):
             return self.time0 + t*self.scu
-        elif np.issubdtype(type(t),float):
+        elif np.issubdtype(type(t),np.floating):
             return num2date(t)
         elif isinstance(t,datetime.datetime):
             return t
@@ -7400,6 +8074,9 @@ END_MULTIGRID"""%num_layers
         hda=os.path.join( self.base_path,self.name+".hda")
         hdf=os.path.join( self.base_path,self.name+".hdf")
         if os.path.exists(hda):
+            if nefis.nef_lib() is None:
+                self.log.warning("Nefis library not configured -- will not read nef history")
+                return None
             return nefis.Nefis(hda, hdf)
         else:
             return None
@@ -7452,7 +8129,6 @@ END_MULTIGRID"""%num_layers
         """
         if output_settings is None:
             output_settings=self.default_ugrid_output_settings
-
 
         if nef is None:
             if mode is 'map':
@@ -7915,8 +8591,10 @@ END_MULTIGRID"""%num_layers
         """
         Copy supporting bloominp file for runs using BLOOM algae
         """
-        shutil.copyfile(self.original_bloominp_path,
-                        os.path.join(self.base_path,'bloominp.d09'))
+        dst=os.path.join(self.base_path,'bloominp.d09')
+        if not self.overwrite:
+            assert not os.path.exists(dst)
+        shutil.copyfile(self.original_bloominp_path,dst)
 
     def cmd_write_inp(self):
         """
@@ -7959,7 +8637,7 @@ END_MULTIGRID"""%num_layers
     def write_nefis_his_nc(self):
         nc2_fn=os.path.join(self.base_path,'dwaq_hist.nc')
         nc2=self.ugrid_history(nc_kwargs=dict(fn=nc2_fn,overwrite=True))
-        # if no history output, no nc2.
+        # if no history output or nefis is not setup, no nc2.
         if nc2:
             nc2.close()
             return True
@@ -7987,7 +8665,7 @@ END_MULTIGRID"""%num_layers
 
         import stompy.model.delft.io as dio
         map_fn=os.path.join(self.base_path,self.name+".map")
-        map_ds=dio.read_map(map_fn,self.hydro.hyd_path)
+        map_ds=dio.read_map(map_fn,self.hydro)
 
         dio.map_add_z_coordinate(map_ds,total_depth='TotalDepth',coord_type='sigma',
                                  layer_dim='layer')
@@ -8005,15 +8683,18 @@ END_MULTIGRID"""%num_layers
         else:
             bloom_part=""
 
-        cmd="{} -waq {} -p {}".format(self.delwaq1_path,
-                                      bloom_part,
-                                      self.proc_path)
+        cmd=[self.delwaq1_path,
+             "-waq", bloom_part,
+             "-p",self.proc_path]
+        #cmd='{} -waq {} -p {}'.format(self.delwaq1_path,
+        #                              bloom_part,
+        #                              self.proc_path)
         self.log.info("Running delwaq1:")
-        self.log.info("  "+ cmd)
+        self.log.info("  "+ " ".join(cmd))
 
         t_start=time.time()
         try:
-            ret=subprocess.check_output(cmd,shell=True,cwd=self.base_path,stderr=subprocess.STDOUT)
+            ret=subprocess.check_output(cmd,shell=False,cwd=self.base_path,stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError as exc:
             self.log.error("problem running delwaq1")
             self.log.error("output: ")
@@ -8024,7 +8705,8 @@ END_MULTIGRID"""%num_layers
         self.log.info("delwaq1 ran in %.2fs"%(time.time() - t_start))
 
         nerrors=nwarnings=-1
-        for line in ret.decode().split("\n"):
+        # dwaq likes to draw boxes with code page 437
+        for line in ret.decode('cp437','ignore').split("\n"):
             if 'Number of WARNINGS' in line:
                 nwarnings=int(line.split()[-1])
             elif 'Number of ERRORS during input' in line:
@@ -8040,21 +8722,21 @@ END_MULTIGRID"""%num_layers
         """
         Run delwaq2 (computation)
         """
-        cmd="{} {}".format(self.delwaq2_path,self.name)
+        cmd=[self.delwaq2_path,self.name]
         if not output_filename:
             output_filename= os.path.join(self.base_path,'delwaq2.out')
 
         t_start=time.time()
         with open(output_filename,'wt') as fp_out:
             self.log.info("Running delwaq2 - might take a while...")
-            self.log.info("  " + cmd)
+            self.log.info("  " + " ".join(cmd))
             
             sim_time=(self.stop_time-self.start_time).total_seconds()
             tail=MonTail(os.path.join(self.base_path,self.name+".mon"),
                          log=self.log,sim_time_seconds=sim_time)
             try:
                 try:
-                    ret=subprocess.check_call(cmd,shell=True,cwd=self.base_path,stdout=fp_out,
+                    ret=subprocess.check_call(cmd,shell=False,cwd=self.base_path,stdout=fp_out,
                                               stderr=subprocess.STDOUT)
                 except subprocess.CalledProcessError as exc:
                     raise WaqException("delwaq2 exited with an error code - check %s"%output_filename)
@@ -8077,28 +8759,46 @@ END_MULTIGRID"""%num_layers
         if 'DELFT_SRC' not in os.environ:
             raise WaqException("Environment variable DELFT_SRC not defined")
         return os.environ['DELFT_SRC']
+    @delft_path.setter
+    def delft_path(self,p):
+        os.environ['DELFT_SRC']=p
     @property
     def delft_bin(self):
         if 'DELFT_BIN' in os.environ:
             return os.environ['DELFT_BIN']
         return os.path.join(self.delft_path,'bin')
+    @delft_bin.setter
+    def delft_bin(self,p):
+        os.environ['DELFT_BIN']=p
     @property
     def delwaq1_path(self):
         return os.path.join(self.delft_bin,'delwaq1')
     @property
     def delwaq2_path(self):
         return os.path.join(self.delft_bin,'delwaq2')
+
+    _share_path=None
+    @property
+    def share_path(self):
+        if self._share_path is None:
+            # this is where it would live for a freshly compiled, not installed
+            # delft3d:
+            return os.path.join(self.delft_path,'engines_gpl/waq/default')
+        else:
+            return self._share_path
+    @share_path.setter
+    def share_path(self,p):
+        self._share_path=p
     @property
     def bloom_path(self):
-        return os.path.join(self.delft_path,'engines_gpl/waq/default/bloom.spe')
+        return os.path.join(self.share_path,'bloom.spe')
     @property
     def original_bloominp_path(self):
         # this gets copied into the model run directory
-        return os.path.join(self.delft_path,'engines_gpl/waq/default/bloominp.d09')
+        return os.path.join(self.share_path,'bloominp.d09')
     @property
     def proc_path(self):
-        return os.path.join(self.delft_path,'engines_gpl/waq/default/proc_def')
-
+        return os.path.join(self.share_path,'proc_def')
 
     # plot process diagrams
     def cmd_plot_process(self,run_name='dwaq'):
@@ -8202,6 +8902,7 @@ class InpFile(object):
 ;
 #1 ; delimiter for the first block
 """
+        assert len(self.desc)==3,"Scenario.desc must have exactly 3 strings"
         return block01.format(self=self,
                               time0=self.fmt_time0(),scu=self.fmt_scu(),
                               substances=self.fmt_substance_names())
@@ -8449,27 +9150,69 @@ INCLUDE '{self.atr_filename}'  ; attributes file
         if len(self.scenario.dispersions)==0:
             return ""
         else:
-            lines=[';Data option',
-                   '1 ; information is constant and provided without defaults']
-
+            # This code is currently limited to constant in time.
+            # for time-variable, the option here is not 1, but
+            # 3.
+            disps=self.scenario.dispersions.values()
+            
+            unsteady=np.array([d.times is not None for d in disps])
+            if unsteady.min()!=unsteady.max():
+                raise Exception("Multiple dispersion arrays specified, with some "
+                                "constant and some unsteady. It's just too much.")
+            unsteady=unsteady[0]
             hydro=self.scenario.hydro
 
-            # add x direction:
-            lines.append("1.0 ; scale factor for x")
-            disps=self.scenario.dispersions.values()
+            lines=['; Data option']
 
-            for exch_i in range(hydro.n_exch_x):
-                vals=[disp.data[exch_i] for disp in disps]
-                lines.append( " ".join(["%.3e"%v for v in vals]) )
+            if unsteady:
+                # page 81 of D-Water Quality Description Input File Manual (1.5.4)
+                lines.append( '3 ; information comes as time functions')
 
-            assert hydro.n_exch_y==0 # not implemented
-                
-            lines.append("1.0 ; scale factor for z")
+                if len(disps)>1:
+                    self.log.warning("Brave soul! Multiple dispersion arrays have not been tested")
+                    
+                for disp in disps:
+                    # RH: assuming that the multiple blocks correspond to potentially
+                    # multiple dispersion arrays. But not sure about that.  Manual
+                    # isn't clear, and there is at least the possibility of multiple
+                    # dispersion arrays in a single block (but that would further require
+                    # each to have the same time dimension).
+                    lines.append( '2 ; this block -- information at breakpoints with linear time interpolation')
+                    lines.append( '%d ; number of items, equals number of exchanges'%hydro.n_exch )
+                    
+                    lines.append( '; exchanges ids (all of them...)')
+                    all_j=np.arange(hydro.n_exch)+1
+                    per_line=10
+                    while all_j.size:
+                        lines.append( " ".join( [str(j) for j in all_j[:per_line]] ) )
+                        all_j=all_j[per_line:]
+                    lines.append( '%d ; number of breakpoints'%len(disp.times))
+                    # code below treats x and z separately. weird. not sure.
+                    # with all 3, I get an error here on the second value.  So try just one.
+                    # that runs. Appears to do the right thing.
+                    lines.append( '1.0 ; scale factors')
+                    for ti,t in enumerate(disp.times):
+                        lines.append( '%d ; time integer at breakpoint %d'%(t,ti) )
+                        for exch_i in range(hydro.n_exch):
+                            lines.append( "%.3e"%disp.data[ti,exch_i] )
+            else:
+                lines.append( '1 ; information is constant and provided without defaults')
 
-            for exch_i in range(hydro.n_exch_x+hydro.n_exch_y,hydro.n_exch):
-                vals=[disp.data[exch_i] for disp in disps]
-                lines.append( " ".join(["%.3e"%v for v in vals]) + "; from each array" )
-                
+                # add x direction:
+                lines.append("1.0 ; scale factor for x")
+
+                for exch_i in range(hydro.n_exch_x):
+                    vals=[disp.data[exch_i] for disp in disps]
+                    lines.append( " ".join(["%.3e"%v for v in vals]) + "; Kx")
+
+                assert hydro.n_exch_y==0 # not implemented
+
+                lines.append("1.0 ; scale factor for z")
+
+                for exch_i in range(hydro.n_exch_x+hydro.n_exch_y,hydro.n_exch):
+                    vals=[disp.data[exch_i] for disp in disps]
+                    lines.append( " ".join(["%.3e"%v for v in vals]) + "; Kz" )
+
             # Write them out to a separate text file
             disp_filename='dispersions.dsp'
             with open(os.path.join(self.scenario.base_path,disp_filename),'wt') as fp:
@@ -8737,8 +9480,14 @@ INCLUDE '{self.atr_filename}'  ; attributes file
 
         for s in subs:
             if s.initial.seg_values is not None:
-                lines.append(" ; spatially varying for {}".format(s.name) )
-                lines += [" %f"%val for val in s.initial.seg_values]
+                # Write this out to a separate file, and INCLUDE it
+                supporting_fn='initial-%s.dat'%s.name
+                with open(os.path.join(self.scenario.base_path,supporting_fn),'wt') as fp:
+                    fp.write(" ; spatially varying for {}\n".format(s.name) )
+                    supp_lines= [" %f"%val for val in s.initial.seg_values]
+                    fp.write("\n".join(supp_lines))
+
+                lines.append("INCLUDE '%s' ; spatially varying for %s"%(supporting_fn,s.name) )
             else:
                 lines.append( " %d*%f ; default for %s"%(self.scenario.hydro.n_seg,
                                                          s.initial.default,s.name) )
@@ -8798,10 +9547,1382 @@ INCLUDE '{self.atr_filename}'  ; attributes file
 
     def text_block10(self):
         lines=[";",
-               "; Statistical output - if any",
-               "; INCLUDE 'tut_fti_waq.stt' ",
-               "; ",
-               " #10 ; delimiter for the tenth block "]
+               "; Statistical output"]
+
+        for sub in self.scenario.stat_output:
+            lines+=["output-operation 'STADAY'"
+                    "  substance '%s'"%sub,
+                    "  suffix    ' '",
+                    "  time-parameter 'TINIT' 'START'",
+                    "  time-parameter 'PERIOD' '0000/00/01-00:00:00'",
+                    "end-output-operation"]
+        
+        lines+=["#10 ; delimiter for the tenth block "]
         return "\n".join(lines)
 
     
+##
+
+class WaqModel(scriptable.Scriptable):
+    """
+    New-style
+    rather than requiring all information to be provided up front,
+    this version of the class follows the simpler approach of
+    the HydroModel class, where the model state can be built up
+    as needed, loaded, written, etc.
+
+    Also transitions to broader usage of np.datetime64 instead of python datetime.
+    """
+    
+    name="waqmodel" # this is used for the basename of the various files.
+    desc=('DWAQ','n/a','n/a') # 3 arbitrary lines of text for description
+
+    time0=None
+    # system clock unit. 
+    scu=datetime.timedelta(seconds=1)
+    scu64=np.timedelta64(1,'s')
+    
+    time_step=None  # these are taken from hydro, unless specified otherwise
+    start_time=None # 
+    stop_time=None  # 
+
+    overwrite=False 
+    
+    # backward differencing,
+    # .60 => second and third keywords are set 
+    # => no dispersion across open boundary
+    # => lower order at boundaries
+    integration_option="15.60"
+
+    #  add quantities to default
+    DEFAULT=DEFAULT
+    mon_output= (DEFAULT,'SURF','LocalDepth') # monitor file
+    grid_output=('SURF','LocalDepth')              # grid topo
+    hist_output=(DEFAULT,'SURF','LocalDepth') # history file
+    map_output =(DEFAULT,'SURF','TotalDepth','LocalDepth')  # map file
+    # Stat output is currently not very configurable, and just allows
+    # specifying which variables to use. See text_block10() above
+    # for the specifics that are used.
+    stat_output=() # defaults to none
+
+    # easier to handle multi-platform read/write with binary, compared to nefis output
+    map_formats=['binary']
+    history_formats=['binary']
+
+    # settings related to paths - a little sneaky, to allow for shorthand
+    # to select the next non-existing subdirectory by setting base_path to
+    # "auto"
+    _base_path="dwaq"
+    @property
+    def base_path(self):
+        if self._base_path=='auto':
+            self._base_path=self.auto_base_path()            
+        return self._base_path
+    @base_path.setter
+    def base_path(self,v):
+        self._base_path=v
+
+    # tuples of name, segment id
+    # some confusion about whether that's a segment id or list thereof
+    # monitor_areas=[ ('single (0)',[1]),
+    #                 ('single (1)',[2]),
+    #                 ('single (2)',[3]),
+    #                 ('single (3)',[4]),
+    #                 ('single (4)',[5]) ]
+    # dwaq bug(?) where having transects but no monitor_areas means history
+    # file with transects is not written.  so always include a dummy:
+    # the output code handles adding 1, so these should be stored zero-based.
+    monitor_areas=( ('dummy',[0]), ) 
+
+    # e.g. ( ('gg_outside', [24,26,-21,-27,344] ), ...  )
+    # where negative signs mean to flip the sign of that exchange.
+    # note that these exchanges are ONE-BASED - this is because the
+    # sign convention is wrapped into the sign, so a zero exchange would
+    # be ambiguous.
+    monitor_transects=()
+
+    # These used to default to 1,1, and 1e-7.
+    # safer to default to 0.0, make the user select something non-zero.
+    base_x_dispersion=0.0 # m2/s
+    base_y_dispersion=0.0 # m2/s
+    base_z_dispersion=0.0 # m2/s
+
+    # these default to simulation start/stop/timestep
+    map_start_time=None
+    map_stop_time=None
+    map_time_step=None
+    # likewise
+    hist_start_time=None
+    hist_stop_time=None
+    hist_time_step=None
+    # and more
+    mon_start_time=None
+    mon_stop_time=None
+    mon_time_step=None
+
+    # getter/setter handle grabbing parameters from the hydro when
+    # set
+    _hydro=None
+
+    def __init__(self,**kw):
+        self.log=logging.getLogger(self.__class__.__name__)
+
+        # list of dicts.  moving towards standard setting of loads via src_tags
+        # should be populated in init_substances(), gets used 
+        self.src_tags=[]
+        self.dispersions=NamedObjects(scenario=self)
+        self.velocities=NamedObjects(scenario=self)
+        self.parameters=self.init_parameters()
+        self.substances=self.init_substances()
+        assert self.substances is not None, "init_substances() did not return anything."
+        
+        utils.set_keywords(self,kw)
+
+        self.init_bcs()
+        self.init_loads()
+
+    # scriptable interface settings:
+    cli_options="hp:"
+    def cli_handle_option(self,opt,val):
+        if opt=='-p':
+            print("Setting base_path to '%s'"%val)
+            self.base_path=val
+        else:
+            super(Scenario,self).cli_handle_option(opt,val)
+        
+    def auto_base_path(self):
+        ymd=datetime.datetime.now().strftime('%Y%m%d')        
+        prefix='dwaq%s'%ymd
+        for c in range(100):
+            base_path=prefix+'%02d'%c
+            if not os.path.exists(base_path):
+                return base_path
+        else:
+            raise Exception("Possible run-away directory naming")
+        
+    @property
+    def n_substances(self):
+        return len(self.substances)
+    @property
+    def n_active_substances(self):
+        return len( [sub for sub in self.substances.values() if sub.active] )
+    @property
+    def n_inactive_substances(self):
+        return len( [sub for sub in self.substances.values() if not sub.active] )
+    
+    @property
+    def multigrid_block(self):
+        """ 
+        inserted verbatim in section 3 of input file.
+        """
+        # appears that for a lot of processes, hydro must be dense wrt segments
+        # exchanges need not be dense, but sparse exchanges necessitate explicitly
+        # providing the number of layers.  And that brings us to this stanza:
+
+        # sparse_layers is actually an input flag to the aggregator
+        # assert not self.hydro.sparse_layers
+        # instead, test this programmatically, and roughly the same as how dwaq will test
+        self.hydro.infer_2d_elements()
+        kmax=self.hydro.seg_k.max()
+        if self.hydro.n_seg != self.hydro.n_2d_elements*(kmax+1):
+            raise Exception("You probably mean to be running with segment-dense hydrodynamics")
+        
+        num_layers=self.hydro.n_seg / self.hydro.n_2d_elements
+        if self.hydro.vertical != self.hydro.SIGMA:
+            return """MULTIGRID
+  ZMODEL NOLAY %d
+END_MULTIGRID"""%num_layers
+        else:
+            return " ; sigma layers - no multigrid stanza"
+
+    @property
+    def hydro(self):
+        return self._hydro
+    @hydro.setter
+    def hydro(self,value):
+        self.set_hydro(value)
+
+    @classmethod
+    def load(cls,path,load_hydro=True):
+        """
+        Working towards a similar ability as in DFlowModel, where an existing
+        run can be loaded.
+        """
+        model=cls(base_path=path)
+        model.overwrite=False
+        # currently very little here...
+
+        if load_hydro:
+            # Try to guess what the right hyd file is
+            model.load_hydro()
+        return model
+
+    def load_hydro(self):
+        hyds=glob.glob(os.path.join(self.base_path,"*.hyd"))
+        if len(hyds)==1:
+            self.hydro=HydroFiles(hyd_path=hyds[0])
+        else:
+            log.info("Could not detect a load-able hyd file")
+        return self.hydro
+    
+    def set_hydro(self,hydro):
+        self._hydro=hydro
+
+        if hydro is None:
+            return
+
+        self._hydro.scenario=self
+
+        # I think it's required that these match
+        self.time0 = self._hydro.time0
+
+        # Other time-related values needn't match, but the hydro
+        # is a reasonable default if no value has been set yet.
+        start,stop,dt=hydro.timeline_data()
+        
+        if self.time_step is None:
+            # note that this is a dwaq-formatted time step, as an integer.
+            # DDDHHMMSS
+            self.time_step=hydro.time_step
+
+        if self.start_time is None:
+            self.start_time=utils.to_dt64(start)
+            self.log.info(" start time updated from hydro: %s"%self.start_time)
+        if self.stop_time is None:
+            self.stop_time=utils.to_dt64(stop)
+            self.log.info(" stop time update from hydro: %s"%self.stop_time)
+            
+        if self.stop_time<self.start_time:
+            self.log.warning("Stop time is before than start time")
+            
+        self.hydro_parameters=self.init_hydro_parameters()
+        self.log.info("Parameters gleaned from hydro: %s"%self.hydro_parameters)
+
+            
+    def init_parameters(self):
+        params=NamedObjects(scenario=self,cast_value=cast_to_parameter)
+        params['ONLY_ACTIVE']=1 # almost always a good idea.
+        params['ACTIVE_DYNDEPTH']=1 # these make the outputs much easier to visualize,
+        params['ACTIVE_TOTDEPTH']=1 # and some tools depend on these.
+        
+        return params
+    def init_hydro_parameters(self):
+        """ parameters which come directly from the hydro, and are
+        written out in the same way that process parameters are 
+        written.
+        """
+        if self.hydro:
+            # in case hydro is re-used, make sure that this call gets a fresh
+            # set of parameters.  some leaky abstraction going on...
+            return self.hydro.parameters(force=True)
+        else:
+            self.log.warning("Why requesting hydro parameters with no hydro?")
+            raise Exception("Tried to initialize hydro parameters without a hydro instance")
+
+    def init_substances(self):
+        # sorts active substances first.
+        return NamedObjects(scenario=self,sort_key=lambda s: not s.active)
+
+    def text_thatcher_harleman_lags(self):
+        return """;
+; Thatcher-Harleman timelags
+0 ; no lags
+        """
+
+    def init_bcs(self):
+        self.bcs=[]
+
+        # RH 2019-09-09: moving to more procedural approach, unsure of whether this
+        # should be included.
+        if 0:
+            # 2017-03-17: moved this bit of boiler plate from a bunch of subclasses
+            # to here in a step towards standardizing the BC settings.
+            boundaries=self.hydro.boundary_defs()
+            ids=[b['id'] for b in boundaries]
+
+            for src_tag in self.src_tags:
+                # conc. defaults to 1.0
+                self.add_bc(src_tag['items'],src_tag['tracer'],src_tag.get('value',1.0))
+
+    def add_bc(self,*args,**kws):
+        bc=BoundaryCondition(*args,**kws)
+        bc.scenario=self
+        self.bcs.append(bc)
+        return bc
+
+    def init_loads(self):
+        """
+        Set up discharges (locations of point sources/sinks), and
+        corresponding loads (e.g. mass/time for a substance at a source)
+        """
+        self.discharges=[]
+        self.loads=[]
+
+    def add_discharge(self,on_exists='exception',*arg,**kws):
+        disch=Discharge(*arg,**kws)
+        disch.scenario=self
+        disch.update_fields()
+        exists=False
+        for other in self.discharges:
+            if other.load_id==disch.load_id:
+                if on_exists=='exception':
+                    raise Exception("Discharge with id='%s' already exists"%other.load_id)
+                elif on_exists=='ignore':
+                    self.log.info("Discharge id='%s' exists - skipping duplicate"%other.load_id)
+                    return other
+                else:
+                    assert False 
+        self.discharges.append(disch)
+        return disch
+
+    def add_load(self,*args,**kws):
+        load=Load(*args,**kws)
+        load.scenario=self
+        self.loads.append(load)
+        return load
+    
+    def add_monitor_from_shp(self,shp_fn,naming='elt_layer',point_layers=True):
+        """
+        For each feature in the shapefile, add a monitor area.
+        shp_fn: path to shapefile
+        naming: generally, a field name from the shapefile giving the name of the monitor area.
+          special case when point_layers is True and the shapefile has points, naming can
+          be "elt_layer" in which case individual segments are monitored separately, and
+          named like elt123_layer45.
+        """
+        assert self.hydro,"Set hydro before calling add_monitor_from_shp"
+
+        locations=wkb2shp.shp2geom(shp_fn)
+        self.hydro.infer_2d_elements()
+
+        g=self.hydro.grid()
+        new_areas=[] # generate as list, then assign as tuple
+        names={}
+        for n,segs in self.monitor_areas:
+            names[n]=True # record names in use to avoid duplicates
+
+        for i,rec in enumerate(locations):
+            geom=rec['geom']
+
+            if point_layers and (geom.type=='Point'):
+                xy=np.array(geom.coords)[0]
+                # would be better to have select_cells_nearest use
+                # centroids instead of circumcenters, but barring
+                # that, throw the net wide and look at up to 40
+                # cells.
+                elt=g.select_cells_nearest(xy,inside=True,count=40)
+                if elt is None:
+                    self.log.warning("Monitor point %s was not found inside a cell"%xy)
+                    # Fall back to nearest
+                    elt=g.select_cells_nearest(xy,inside=False)
+
+                segs=np.nonzero( self.hydro.seg_to_2d_element==elt )[0]
+                for layer,seg in enumerate(segs):
+                    if naming=='elt_layer':
+                        name="elt%d_layer%d"%(elt,layer)
+                    else:
+                        name="%s_layer%d"%(rec[naming],layer)
+                    if name not in names:
+                        new_area=(name,[seg])
+                        self.monitor_areas = self.monitor_areas + (new_area,)
+                        names[name]=True
+                    else:
+                        self.log.warning("Duplicate requests to monitor %s"%name)
+            else:
+                try:
+                    name=rec[naming]
+                except:
+                    name="mon%d"%len(self.monitor_areas)
+                self.add_monitor_for_geometry(name=name,geom=geom)
+                
+    def add_monitor_for_geometry(self,name,geom):
+        """
+        Add a monitor area for elements intersecting the shapely geometry geom.
+        """
+        # make sure the name is unique
+        for n,segs in self.monitor_areas:
+            assert name!=n
+        
+        g=self.hydro.grid()
+        # bitmask over 2D elements
+        self.log.info("Selecting elements in polygon '%s'"%name)
+        # better to go by center, so that non-intersecting polygons
+        # yield non-intersecting sets of elements and segments
+        # 2019-09-12: use centroid instead of center in case the grid has weird geometry
+        # 2020-01-31: use representative points. It's possible for centroid not to fall within
+        #      the polygon.  Don't use full polygon, because that will pick up adjacent 
+        #      cells that share an edge.
+        elt_sel=g.select_cells_intersecting(geom,by_center='representative') # few seconds
+
+        # extend to segments:
+        seg_sel=elt_sel[ self.hydro.seg_to_2d_element ] & (self.hydro.seg_to_2d_element>=0)         
+        segs=np.nonzero( seg_sel )[0]
+
+        new_area= (name,segs) 
+
+        self.log.info("Added %d monitored segments for %s"%(len(segs),name))
+        self.monitor_areas = self.monitor_areas + ( new_area, )
+
+    def add_transects_from_shp(self,shp_fn,naming='count',clip_to_poly=True,
+                               on_boundary='warn_and_skip',on_edge=False):
+        """
+        Add monitor transects from a shapefile.
+        By default transects are named in sequence.  
+        Specify a shapefile field name in 'naming' to pull user-specified
+        names for the transects.
+        """
+        if on_edge:
+            # RH 2020-01-31: on_edge is from ZZ code. I'm not clear on the purpose,
+            #  it's now included for back-compatibilty in the WaqScenario class, but
+            #  moving forward I'm trying to discourage it unless a specific use-case
+            #  arises.
+            self.log.warning("add_transects_from_shp: on_edge was set. In WaqModel this does nothing")
+                             
+        assert self.hydro,"Set hydro before calling add_transects_from_shp"
+        locations=wkb2shp.shp2geom(shp_fn)
+        g=self.hydro.grid()
+
+        if clip_to_poly:
+            poly=g.boundary_polygon()
+            
+        new_transects=[] # generate as list, then assign as tuple
+
+        for i,rec in enumerate(locations):
+            geom=rec['geom']
+
+            if geom.type=='LineString':
+                if clip_to_poly:
+                    clipped=geom.intersection(poly)
+
+                    # rather than assume that clipped comes back with
+                    # the same orientation, and multiple pieces come
+                    # back in order, manually re-assemble the line
+                    if clipped.type=='LineString':
+                        segs=[clipped]
+                    else:
+                        segs=clipped.geoms
+
+                    all_dists=[]
+                    for seg in segs:
+                        for xy in seg.coords:
+                            all_dists.append( geom.project( geometry.Point(xy) ) )
+                    # sorting the distances ensures that orientation is same as
+                    # original
+                    all_dists.sort()
+
+                    xy=[geom.interpolate(d) for d in all_dists]
+                else:
+                    xy=np.array(geom.coords)
+                    
+                if naming=='count':
+                    name="transect%04d"%i
+                else:
+                    name=rec[naming]
+                exchs=self.hydro.path_to_transect_exchanges(xy,on_boundary=on_boundary)
+                new_transects.append( (name,exchs) )
+            else:
+                self.log.warning("Not ready to handle geometry type %s"%geom.type)
+        self.log.info("Added %d monitored transects from %s"%(len(new_transects),shp_fn))
+        self.monitor_transects = self.monitor_transects + tuple(new_transects)
+
+    def add_area_boundary_transects(self,exclude='dummy'):
+        """
+        create monitor transects for the common boundaries between a subset of
+        monitor areas. this assumes that the monitor areas are distinct - no
+        overlapping cells (in fact it asserts this).
+        The method and the non-overlapping requirement apply only for areas which
+        do *not* match the exclude regex.
+        """
+        assert self.hydro,"Set hydro before calling add_area_boundary_transects"
+        
+        areas=[a[0] for a in self.monitor_areas]
+        if exclude is not None:
+            areas=[a for a in areas if not re.match(exclude,a)]
+
+        mon_areas=dict(self.monitor_areas)
+
+        seg_to_area=np.zeros(self.hydro.n_seg,'i4')-1
+
+        for idx,name in enumerate(areas):
+            # make sure of no overlap:
+            assert np.all( seg_to_area[ mon_areas[name] ] == -1 )
+            # and label to this area:
+            seg_to_area[ mon_areas[name] ] = idx
+
+        poi0=self.hydro.pointers - 1
+
+        exch_areas=seg_to_area[poi0[:,:2]]
+        # fix up negatives in poi0
+        exch_areas[ poi0[:,:2]<0 ] = -1
+
+        # convert to tuples so we can get unique pairs
+        exch_areas_tupes=set( [ tuple(x) for x in exch_areas if x[0]!=x[1] and x[0]>=0 ] )
+        # make the order canonical 
+        canon=set()
+        for a,b in exch_areas_tupes:
+            if a>b:
+                a,b=b,a
+            canon.add( (a,b) )
+        canon=list(canon) # re-assert order
+
+        names=[]
+        exch1s=[]
+
+        for a,b in canon:
+            self.log.info("%s <-> %s"%(areas[a],areas[b]))
+            name=areas[a][:9] + "__" + areas[b][:9]
+            self.log.info("  name: %s"%name)
+            names.append(name)
+
+            fwd=np.nonzero( (exch_areas[:,0]==a) & (exch_areas[:,1]==b) )[0]
+            rev=np.nonzero( (exch_areas[:,1]==a) & (exch_areas[:,0]==b) )[0]
+            exch1s.append( np.concatenate( (fwd+1, -(rev+1)) ) )
+            self.log.info("  exchange count: %d"%len(exch1s[-1]))
+
+        # and add to transects:
+        transects=tuple(zip(names,exch1s))
+        self.monitor_transects=self.monitor_transects + transects
+        
+    def add_transect(self,name,exchanges):
+        """ Append a transect definition for logging.
+        """
+        self.monitor_transects = self.monitor_transects + ( (name,exchanges), )
+        
+    def ensure_base_path(self):
+        if not os.path.exists(self.base_path):
+            os.makedirs(self.base_path)
+
+    def write_inp(self):
+        """
+        Write the inp file for delwaq1/delwaq2
+        """
+        self.ensure_base_path()
+        # parameter files are also written along the way
+        inp=InpFile(scenario=self)
+        inp.write()
+
+    def write_hydro(self):
+        self.ensure_base_path()
+        self.hydro.overwrite=self.overwrite
+        self.hydro.write()
+
+    _pdb=None
+    @property
+    def process_db(self):
+        if self._pdb is None:
+            self._pdb = waq_process.ProcessDB(scenario=self)
+        return self._pdb
+    def lookup_item(self,name):
+        return self.process_db.substance_by_id(name)
+
+    def as_datetime(self,t):
+        """
+        t can be a datetime object, an integer number of seconds since time0,
+        or a floating point datenum
+        """
+        if np.issubdtype(type(t),np.integer):
+            return self.time0 + t*self.scu
+        else:
+            return utils.to_datetime(t)
+
+    def fmt_datetime(self,t):
+        """ 
+        return datetime formatted as text.
+        format is part of input file configuration, but 
+        for now, stick with 1990/08/15-12:30:00
+
+        t is specified as in as_datetime() above.
+        """
+        return self.as_datetime(t).strftime('%Y/%m/%d-%H:%M:%S')
+
+    #-- Access to output files
+    def nef_history(self):
+        hda=os.path.join( self.base_path,self.name+".hda")
+        hdf=os.path.join( self.base_path,self.name+".hdf")
+        if os.path.exists(hda):
+            if nefis.nef_lib() is None:
+                self.log.warning("Nefis library not configured -- will not read nef history")
+                return None
+            return nefis.Nefis(hda, hdf)
+        else:
+            return None
+    def nef_map(self):
+        ada=os.path.join(self.base_path, self.name+".ada")
+        adf=os.path.join(self.base_path, self.name+".adf")
+        if os.path.exists(ada):
+            return nefis.Nefis( ada,adf)
+        else:
+            return None
+
+    #  netcdf versions of those:
+    def nc_map(self,nc_kwargs={}):
+        nef=self.nef_map()
+        try:
+            elt_map,real_map = map_nef_names(nef)
+
+            nc=nefis_nc.nefis_to_nc(nef,element_map=elt_map,nc_kwargs=nc_kwargs)
+            for vname,rname in iteritems(real_map):
+                nc.variables[vname].original_name=rname
+            # the nefis file does not contain enough information to get
+            # time back to a real calendar, so rely on the Scenario's
+            # version of time0
+            if 'time' in nc.variables:
+                nc.time.units='seconds since %s'%self.time0.strftime('%Y-%m-%d %H:%M:%S')
+        finally:
+            nef.close()
+        return nc
+
+    def hist_ds(self):
+        """
+        Shifting to a slightly more standarized way of accessing history output
+        """
+        # this is the file that we postprocess and write out
+        hist_nc_fn=os.path.join(self.base_path,'dwaq_hist.nc')
+
+        if not os.path.exists(hist_nc_fn):
+            self.cmd_write_his_nc()
+            
+        assert os.path.exists(hist_nc_fn),"Trouble writing history nc file"
+        return xr.open_dataset(hist_nc_fn)
+
+    def map_ds_path(self):
+        return os.path.join(self.base_path,"dwaq_map.nc")
+        
+    def map_ds(self):
+        """
+        Shifting to a slightly more standarized way of accessing map output
+        """
+        map_nc_fn=self.map_ds_path()
+        
+        if not os.path.exists(map_nc_fn):
+            self.cmd_write_map_nc()
+            assert os.path.exists(map_nc_fn),"Trouble writing map nc file"
+        return xr.open_dataset(map_nc_fn)
+    
+    # try to find the common chunks of code between writing ugrid
+    # nc output and the history output
+    def ugrid_map(self,nef=None,nc_kwargs={}):
+        return self.ugrid_nef(mode='map',nef=nef,nc_kwargs=nc_kwargs)
+
+    def ugrid_history(self,nef=None,nc_kwargs={}):
+        return self.ugrid_nef(mode='history',nef=nef,nc_kwargs=nc_kwargs)
+
+    default_ugrid_output_settings=['quickplot_compat']
+    
+    def ugrid_nef(self,mode='map',nef=None,nc_kwargs={},output_settings=None):
+        """ Like nc_map, but write a netcdf file more ugrid compliant.
+        this is actually pretty different, as ugrid requires that 3D
+        field is organized into a horizontal dimension (i.e element)
+        and vertical dimension (layer).  the original nefis code
+        just gives segment.
+        nef: supply an already open nef.  Note that caller is responsible for closing it!
+        mode: 'map' use the map output
+              'history' use history output
+        """
+        if output_settings is None:
+            output_settings=self.default_ugrid_output_settings
+
+        if nef is None:
+            if mode is 'map':
+                nef=self.nef_map()
+            elif mode is 'history':
+                nef=self.nef_history()
+            close_nef=True
+        else:
+            close_nef=False
+        if nef is None: # file didn't exist
+            self.log.info("NEFIS file didn't exist. Skipping ugrid_nef()")
+            return None
+            
+        flowgeom=self.flowgeom()
+        mesh_name="FlowMesh" # sync with sundwaq for now.
+
+        if flowgeom is not None:
+            nc=flowgeom.copy(**nc_kwargs)
+        else:
+            nc=qnc.empty(**nc_kwargs)
+        nc._set_string_mode('fixed') # required for writing to disk
+
+        self.hydro.infer_2d_elements()
+
+        try:
+            if mode is 'map':
+                seg_k = self.hydro.seg_k
+                seg_elt = self.hydro.seg_to_2d_element
+                n_locations=len(seg_elt)
+            elif mode is 'history':
+                # do we go through the location names, trying to pull out elt_k? no - as needed,
+                # use self.monitor_areas.
+
+                # maybe the real question is how will the data be organized in the output?
+                # if each history output can be tied to a single segment, that's one thing.
+                # Could subset the grid, or keep the full grid and pad the data with fillvalue.
+                # but if some/all of the output goes to multiple segments, then what?
+                # keep location_name in the output?
+                # maybe we skip any notion of ugrid, and instead follow a more CF observed features
+                # structure?
+
+                # also, whether from the original Scenario, or by reading in the inp file, we can get
+                # the original map between location names and history outputs
+                # for the moment, classify everything in the file based on the first segment
+                # listed
+
+                # try including the full grid, and explicitly output the mapping between history
+                # segments and the 2D+z grid.
+                hist_segs=[ma[1][0] for ma in self.monitor_areas]
+                seg_k=self.hydro.seg_k[ hist_segs ]
+                seg_elt=self.hydro.seg_to_2d_element[hist_segs]
+
+                # Need to handle transects - maybe that's handled entirely separately.
+                # even so, the presence of transects will screw up the matching of dimensions
+                # below for history output.
+                # pdb.set_trace()
+
+                # i.e. current output with transect:
+                # len(seg_elt)==135
+                # but we ended up creating an anonymous dimension d138
+                # (a) could consult scenario to get the count of transects
+                # (b) is there anything in the NEFIS file to indicate transect output?
+                # (c) could use the names as a hint
+                #     depends on the input file, but currently have things like eltNNN_layerNN
+                #     vs. freeform for transects
+
+                # what about just getting the shape from the LOCATIONS field?
+                shape,dtype = nef['DELWAQ_PARAMS'].getelt('LOCATION_NAMES',shape_only=True)
+                n_locations=shape[1]
+                if n_locations>len(seg_elt):
+                    self.log.info("Looks like there were %d transects, too?"%(n_locations - len(seg_elt)))
+                elif n_locations<len(seg_elt):
+                    self.log.warning("Weird - fewer output locations than anticipated! %d vs %d"%(n_locations,
+                                                                                                  len(seg_elt)))
+            else:
+                assert False
+
+            n_layers= seg_k.max() + 1
+
+            # elt_map: 'SUBST_001' => 'oxy'
+            # real_map: 'saturoxy' => 'SaturOXY'
+            elt_map,real_map = map_nef_names(nef)
+
+            # check for unique element names
+            name_count=defaultdict(lambda: 0)
+            for group in nef.groups():
+                for elt_name in group.cell.element_names:
+                    name_count[elt_name]+=1
+
+            # check for unique unlimited dimension:
+            n_unl=0
+            for group in nef.groups():
+                # there are often multiple unlimited dimensions.
+                # hopefully just 1 unlimited in the RESULTS group
+                if 0 in group.shape and group.name=='DELWAQ_RESULTS':
+                    n_unl+=1
+
+            # give the user a sense of how many groups are being
+            # written out:
+            self.log.info("Elements to copy from NEFIS:")
+            for group in nef.groups():
+                for elt_name in group.cell.element_names:
+                    nef_shape,nef_type=group.getelt(elt_name,shape_only=True)
+                    vshape=group.shape + nef_shape
+                    self.log.info("  %s.%s: %s (%s)"%(group.name,
+                                                      elt_name,
+                                                      vshape,nef_type))
+
+            for group in nef.groups():
+                g_shape=group.shape
+                grp_slices=[slice(None)]*len(g_shape)
+                grp_dim_names=[None]*len(g_shape)
+
+                # infer that an unlimited dimension in the RESULTS
+                # group is time.
+                if 0 in g_shape and group.name=='DELWAQ_RESULTS':
+                    idx=list(g_shape).index(0)
+                    if n_unl==1: # which will be named
+                        grp_dim_names[idx]='time'
+
+                for elt_name in group.cell.element_names:
+                    # print("elt name is",elt_name)
+
+                    # Choose a variable name for this element
+                    if name_count[elt_name]==1:
+                        vname=elt_name
+                    else:
+                        vname=group.name + "_" + elt_name
+
+                    if vname in elt_map:
+                        vname=elt_map[vname]
+                    else:
+                        vname=vname.lower()
+
+                    self.log.info("Writing variable %s"%vname)
+                    subst=self.lookup_item(vname) # may be None!
+                    if subst is None:
+                        self.log.info("No metadata from process library on %s"%repr(vname))
+
+                    # START time-iteration HERE
+                    # for large outputs, need to step through time
+                    # assume that only groups with 'time' as a dimension
+                    # (as detected above) need to be handled iteratively.
+                    # 'time' assumed to be part of group shape.
+                    # safe to always iterate on time.
+
+                    # nef_shape is the shape of the element subject to grp_slices,
+                    # as understood by nefis, before squeezing or projecting to [cell,layer]
+                    nef_shape,value_type=group.getelt(elt_name,shape_only=True)
+                    self.log.debug("nef_shape: %s"%nef_shape )
+                    self.log.debug("value_type: %s"%value_type )
+
+                    if value_type.startswith('f'):
+                        fill_value=np.nan
+                    elif value_type.startswith('S'):
+                        fill_value=None
+                    else:
+                        fill_value=-999
+
+                    nef_to_squeeze=[slice(None)]*len(nef_shape)
+                    if 1: # squeeze unit element dimensions
+                        # iterate over just the element portion of the shape
+                        squeeze_shape=list( nef_shape[:len(g_shape)] )
+                        for idx in range(len(g_shape),len(nef_shape)):
+                            if nef_shape[idx]==1:
+                                nef_to_squeeze[idx]=0
+                            else:
+                                squeeze_shape.append(nef_shape[idx])
+                    else: # no squeeze
+                        squeeze_shape=list(nef_shape)
+
+                    self.log.debug("squeeze_shape: %s"%squeeze_shape)
+                    self.log.debug("nef_to_squeeze: %s"%nef_to_squeeze)
+
+                    # mimics qnc naming - will come back to expand 3D fields
+                    # and names
+                    dim_names=[qnc.anon_dim_name(size=l) for l in squeeze_shape]
+                    for idx,name in enumerate(grp_dim_names): # okay since squeeze only does elt dims
+                        if name:
+                            dim_names[idx]=name
+
+                    # special handling for results, which need to be mapped 
+                    # back out to 3D
+                    proj_shape=list(squeeze_shape)
+                    if group.name=='DELWAQ_RESULTS' and self.hydro.n_seg in squeeze_shape:
+                        seg_idx = proj_shape.index(self.hydro.n_seg)
+                        proj_shape[seg_idx:seg_idx+1]=[self.hydro.n_2d_elements,
+                                                       n_layers]
+                        # the naming of the layers dimension matches assumptions in ugrid.py
+                        # not sure how this is supposed to be specified
+                        dim_names[seg_idx:seg_idx+1]=["nFlowElem","nFlowMesh_layers"]
+
+                        # new_value=np.zeros( new_shape, value_type )
+                        # new_value[...]=fill_value
+
+                        # this is a little tricky, but seems to work.
+                        # map segments to (elt,layer), and all other dimensions
+                        # get slice(None).
+                        # vmap assumes no group slicing, and is to be applied
+                        # to the projected array (projection does not involve
+                        # any slices on the nefis src side)
+                        vmap=[slice(None) for _ in proj_shape]
+                        vmap[seg_idx]=seg_elt
+                        vmap[seg_idx+1]=seg_k
+                        # new_value[vmap] = value
+                    elif group.name=='DELWAQ_RESULTS' and n_locations in squeeze_shape:
+                        # above and below: n_locations used to be len(seg_elt)
+                        # but it's still writing out things like location_names with
+                        # an anonymous dimension
+                        seg_idx = proj_shape.index(n_locations)
+                        # note that nSegment is a bit of a misnomer, might have some transects
+                        # in there, too.
+                        dim_names[seg_idx]="nSegment"
+                    else:
+                        vmap=None # no projection
+
+                    for dname,dlen in zip(dim_names,proj_shape):
+                        if dname=='time':
+                            # if time is not specified as unlimited, it gets
+                            # included as the fastest-varying dimension, which
+                            # makes writes super slow.
+                            nc.add_dimension(dname,0)
+                        else:
+                            nc.add_dimension(dname,dlen)
+
+                    # most of the time goes into writing.
+                    # typically people optimize chunksize, but HDF5 is
+                    # throwing an error when time chunk>1, so it's
+                    # hard to imagine any improvement over the defaults.
+                    ncvar=nc.createVariable(vname,np.dtype(value_type),dim_names,
+                                            fill_value=fill_value,
+                                            complevel=2,
+                                            zlib=True)
+
+                    if vmap is not None:
+                        nc.variables[vname].mesh=mesh_name
+                        # these are specifically the 2D horizontal metadata
+                        if 'quickplot_compat' in output_settings:
+                            # as of Delft3D_4.01.01.rc.03, quickplot only halfway understands
+                            # ugrid, and actually does better when location is not specified.
+                            self.log.info('Dropping location for quickplot compatibility')
+                        else:
+                            nc.variables[vname].location='face' # 
+                        nc.variables[vname].coordinates="FlowElem_xcc FlowElem_ycc"
+
+                    if subst is not None:
+                        if hasattr(subst,'unit'):
+                            # in the process table units are parenthesized
+                            units=subst.unit.replace('(','').replace(')','')
+                            # no guarantee of CF compliance here...
+                            nc.variables[vname].units=units
+                        if hasattr(subst,'item_nm'):
+                            nc.variables[vname].long_name=subst.item_nm
+                        if hasattr(subst,'aggrega'):
+                            nc.variables[vname].aggregation=subst.aggrega
+                        if hasattr(subst,'groupid'):
+                            nc.variables[vname].group_id=subst.groupid
+
+                    if 'time' in dim_names:
+                        # only know how to deal with time as the first index
+                        assert dim_names[0]=='time'
+                        self.log.info("Will iterate over %d time steps"%proj_shape[0])
+
+                        total_tic=t_last=time.time()
+                        read_sum=0
+                        write_sum=0
+                        for ti in range(proj_shape[0]):
+                            read_sum -= time.time()
+                            value_slice=group.getelt(elt_name,[ti])
+                            read_sum += time.time()
+
+                            if vmap is not None:
+                                proj_slice=np.zeros(proj_shape[1:],value_type)
+                                proj_slice[...]=fill_value
+                                proj_slice[tuple(vmap[1:])]=value_slice
+                            else:
+                                proj_slice=value_slice
+                            write_sum -= time.time()
+                            ncvar[ti,...] = proj_slice
+                            write_sum += time.time()
+
+                            if (time.time() - t_last > 2) or (ti+1==proj_shape[0]):
+                                t_last=time.time()
+                                self.log.info('  time step %d / %d'%(ti,proj_shape[0]))
+                                self.log.info('  time for group so far: %fs'%(t_last-total_tic))
+                                self.log.info('  reading so far: %fs'%(read_sum))
+                                self.log.info('  writing so far: %fs'%(write_sum))
+
+                    else:
+                        value=group.getelt(elt_name)
+                        if vmap is not None:
+                            proj_value=value[tuple(vmap)]
+                        else:
+                            proj_value=value
+                        # used to have extraneous[?] names.append(Ellipsis)
+                        ncvar[:]=proj_value
+
+                    setattr(ncvar,'group_name',group.name)
+            ####
+
+            for vname,rname in iteritems(real_map):
+                nc.variables[vname].original_name=rname
+            # the nefis file does not contain enough information to get
+            # time back to a real calendar, so rely on the Scenario's
+            # version of time0
+            if 'time' in nc.variables:
+                nc.time.units='seconds since %s'%self.time0.strftime('%Y-%m-%d %H:%M:%S')
+                nc.time.standard_name='time'
+                nc.time.long_name='time relative to model time0'
+
+        finally:
+            if close_nef:
+                nef.close()
+
+        # cobble together surface h, depth info.
+        if 'time' in nc.variables:
+            t=nc.time[:]
+        else:
+            t=None # not going to work very well...or at all
+
+        z_bed=nc.FlowElem_bl[:]
+        # can't be sure of what is included in the output, so have to try some different
+        # options
+
+        if 1:
+            if mode is 'map':
+                etavar=nc.createVariable('eta',np.float32,['time','nFlowElem'],
+                                         zlib=True)
+                etavar.standard_name='sea_surface_height_above_geoid'
+                etavar.mesh=mesh_name
+
+                for ti in range(len(nc.dimensions['time'])):
+                    # due to a possible DWAQ bug, we have to be very careful here
+                    # depths in dry upper layers are left at their last-wet value,
+                    # and count towards totaldepth and localdepth.  That's fixed in
+                    # DWAQ now.
+                    if 'totaldepth' in nc.variables:
+                        depth=nc.variables['totaldepth'][ti,:,0]
+                    elif 'depth' in nc.variables:
+                        depth=np.nansum(nc.variables['depth'][ti,:,:],axis=2)
+                    else:
+                        # no freesurface info.
+                        depth=-z_bed[None,:] 
+
+                    z_surf=z_bed + depth
+                    etavar[ti,:]=z_surf
+            elif mode is 'history':
+                # tread carefully in case there is nothing useful in the history file.
+                if 'totaldepth' in nc.variables and 'nSegment' in nc.dimensions:
+                    etavar=nc.createVariable('eta',np.float32,['time',"nSegment"],
+                                             zlib=True)
+                    etavar.standard_name='sea_surface_height_above_geoid'
+
+                    # some duplication when we have multiple layers of the
+                    # same watercolumn
+                    # can only create eta for history output, nan for transects
+                    pad=np.nan*np.ones(n_locations-len(seg_elt),'f4')
+                    for ti in range(len(nc.dimensions['time'])):
+                        depth=nc.variables['totaldepth'][ti,:]
+                        z_surf=z_bed[seg_elt]
+                        z_surf=np.concatenate( (z_surf,pad) )+depth
+                        etavar[ti,:]=z_surf
+                else:
+                    self.log.info('Insufficient info in history file to create eta')
+
+        if 1: # extra mapping info for history files
+            pad=-1*np.ones( n_locations-len(seg_elt),'i4')
+            if mode is 'history':
+                nc['element']['nSegment']=np.concatenate( (seg_elt,pad) )
+                nc['layer']['nSegment']=np.concatenate( (seg_k,pad) )
+                if flowgeom:
+                    xcc=flowgeom.FlowElem_xcc[:]
+                    ycc=flowgeom.FlowElem_ycc[:]
+                    nc['element_x']['nSegment']=np.concatenate( (xcc[seg_elt],np.nan*pad) )
+                    nc['element_y']['nSegment']=np.concatenate( (ycc[seg_elt],np.nan*pad) )
+
+        # extra work to make quickplot happy
+        if mode is 'map' and 'quickplot_compat' in output_settings:
+            # add in some attributes and fields which might make quickplot happier
+            # Add in node depths
+            
+            # g=unstructured_grid.UnstructuredGrid.from_ugrid(nc)
+            x_nc=self.flowgeom_ds()
+            g=unstructured_grid.UnstructuredGrid.from_ugrid(x_nc)
+
+            # dicey - assumes particular names for the fields:
+            if 'FlowElem_zcc' in nc and 'Node_z' not in nc:
+                self.log.info('Adding a node-centered depth via interpolation')
+                nc['Node_z']['nNode']=g.interp_cell_to_node(nc.FlowElem_zcc[:])
+                nc.Node_z.units='m'
+                nc.Node_z.positive='up',
+                nc.Node_z.standard_name='sea_floor_depth',
+                nc.Node_z.long_name="Bottom level at net nodes (flow element's corners)"
+                nc.Node_z.coordinates=nc[mesh_name].node_coordinates
+                
+            # need spatial attrs for node coords
+            node_x,node_y = nc[mesh_name].node_coordinates.split()
+            nc[node_x].units='m'
+            nc[node_x].long_name='x-coordinate of net nodes'
+            nc[node_x].standard_name='projection_x_coordinate'
+            
+            nc[node_y].units='m',
+            nc[node_y].long_name='y-coordinate of net nodes'
+            nc[node_y].standard_name='projection_y_coordinate'
+
+            for k,v in six.iteritems(nc.variables):
+                if 'location' in v.ncattrs():
+                    self.log.info("Stripping location attribute from %s for quickplot compatibility"%k)
+                    v.delncattr('location')
+
+                # some of the grids being copied through are missing this, even though waq_scenario
+                # is supposed to write it out.
+                if 'standard_name' in v.ncattrs() and v.standard_name=='ocean_sigma_coordinate':
+                    v.formula_terms="sigma: nFlowMesh_layers eta: eta depth: FlowElem_bl"
+                    
+        return nc
+
+    _flowgeom_ds=None
+    def flowgeom_ds(self):
+        """ Returns a netcdf dataset with the grid geometry, or None
+        if the data is not around.  Returns as an xarray Dataset.
+        """
+        assert self.hydro,"Must set hydro before requesting flowgeom_ds"
+        if self._flowgeom_ds is None:
+            fn=os.path.join(self.base_path,self.hydro.flowgeom_filename)
+            if os.path.exists(fn):
+                self._flowgeom_ds=xr.open_dataset(fn)
+        
+        return self._flowgeom_ds
+    
+    #-- Command line access
+    def cmd_write_runid(self):
+        """
+        Label run name in the directory, needed for some delwaq2 (confirm?)
+
+        Maybe this can be supplied on the command line, too?
+        """
+        self.ensure_base_path()
+
+        if self.use_bloom:
+            fn=os.path.join(self.base_path,'runid.eco')
+        else:
+            fn=os.path.join(self.base_path,'runid.waq')
+
+        if os.path.exists(fn) and not self.overwrite:
+            raise Exception("%s exists, but overwrite is False"%fn)
+        
+        with open(fn,'wt') as fp:
+            fp.write("%s\n"%self.name)
+            fp.write("y\n")
+
+    def cmd_write_bloominp(self):
+        """
+        Copy supporting bloominp file for runs using BLOOM algae
+        """
+        dst=os.path.join(self.base_path,'bloominp.d09')
+        if os.path.exists(dst) and not self.overwrite:
+            raise Exception("%s exists, but overwrite is False"%dst)
+        
+        shutil.copyfile(self.original_bloominp_path,dst)
+
+    def cmd_write_inp(self):
+        """
+        Write inp file and supporting files (runid, bloominp.d09) for
+        delwaq1/2
+        """
+        self.ensure_base_path()
+
+        self.log.debug("Writing inp file")
+        self.write_inp()
+
+        self.cmd_write_bloominp()
+        self.cmd_write_runid()
+
+    def cmd_write_hydro(self):
+        """
+        Create hydrodynamics data ready for input to delwaq1
+        """
+
+        self.ensure_base_path()
+
+        self.log.info("Writing hydro data")
+        self.write_hydro()
+
+    def cmd_default(self):
+        """
+        Prepare all inputs for delwaq1 (hydro, runid, inp files)
+        """
+        self.cmd_write_hydro()
+        self.cmd_write_inp()
+
+    def cmd_write_nc(self):
+        """ Transcribe binary or NEFIS to NetCDF for a completed DWAQ run 
+        """
+        self.cmd_write_his_nc()
+        self.cmd_write_map_nc()
+        
+    def cmd_write_his_nc(self):
+        self.write_binary_his_nc() or self.write_nefis_his_nc()
+        
+    def cmd_write_map_nc(self):
+        # binary is faster and doesn't require dwaq libraries, but
+        # does not know about units.
+        self.write_binary_map_nc() or self.write_nefis_map_nc()
+
+    def write_binary_his_nc(self):
+        """ If binary history output is present, write that out to netcdf, otherwise
+        return False
+        """
+        his_fn=os.path.join(self.base_path,self.name+".his")
+        his_nc_fn=os.path.join(self.base_path,'dwaq_hist.nc')
+        
+        if not os.path.exists(his_fn): return False
+        ds=dio.his_file_xarray(his_fn)
+        if os.path.exists(his_nc_fn):
+            os.unlink(his_nc_fn)
+        ds.to_netcdf(his_nc_fn)
+        
+    def write_nefis_his_nc(self):
+        nc2_fn=os.path.join(self.base_path,'dwaq_hist.nc')
+        nc2=self.ugrid_history(nc_kwargs=dict(fn=nc2_fn,overwrite=True))
+        # if no history output or nefis is not setup, no nc2.
+        if nc2:
+            nc2.close()
+            return True
+        else:
+            return False
+        
+    def write_nefis_map_nc(self):
+        nc_fn=os.path.join(self.base_path,'dwaq_map.nc')
+        nc=self.ugrid_map(nc_kwargs=dict(fn=nc_fn,overwrite=True))
+        # if no map output, no nc
+        if nc:
+            nc.close()
+            return True
+        else:
+            return False
+        
+    def write_binary_map_nc(self):
+        """
+        Transcribe binary formatted map output from completed dwaq
+        run to a ugrid-esque netcdf file.  Currently assumes sigma
+        coordinates!
+        """
+        if 'binary' not in self.map_formats:
+            return False
+
+        from . import io as dio
+        map_fn=os.path.join(self.base_path,self.name+".map")
+        map_ds=dio.read_map(map_fn,self.hydro)
+
+        dio.map_add_z_coordinate(map_ds,total_depth='TotalDepth',coord_type='sigma',
+                                 layer_dim='layer')
+
+        out_fn=os.path.join(self.base_path,"dwaq_map.nc")
+        if os.path.exists(out_fn):
+            if self.overwrite:
+                os.unlink(out_fn)
+            else:
+                raise Exception("While writing binary map nc to %s: file exists, overwrite is False"%out_fn)
+        map_ds.to_netcdf(out_fn)
+        return True
+
+    use_bloom=False
+    def cmd_delwaq1(self):
+        """
+        Run delwaq1 preprocessor
+        """
+        if self.use_bloom:
+            bloom_part="-eco {}".format(self.bloom_path)
+        else:
+            bloom_part=""
+
+        cmd=[self.delwaq1_path,
+             "-waq", bloom_part,
+             "-p",self.proc_path]
+        self.log.info("Running delwaq1:")
+        self.log.info("  "+ " ".join(cmd))
+
+        t_start=time.time()
+        try:
+            ret=subprocess.check_output(cmd,shell=False,cwd=self.base_path,stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError as exc:
+            self.log.error("problem running delwaq1")
+            self.log.error("output: ")
+            self.log.error("-----")
+            self.log.error(exc.output)
+            self.log.error("-----")
+            raise WaqException("delwaq1 exited early.  check lst and lsp files")
+        self.log.info("delwaq1 ran in %.2fs"%(time.time() - t_start))
+
+        nerrors=nwarnings=-1
+        # dwaq likes to draw boxes with code page 437
+        for line in ret.decode('cp437','ignore').split("\n"):
+            if 'Number of WARNINGS' in line:
+                nwarnings=int(line.split()[-1])
+            elif 'Number of ERRORS during input' in line:
+                nerrors=int(line.split()[-1])
+        if nerrors > 0 or nwarnings>0:
+            ret=ret.decode() # sometimes this comes back as bytes, and prints better if decoded
+            print( ret )
+            raise WaqException("delwaq1 found %d errors and %d warnings"%(nerrors,nwarnings))
+        elif nerrors < 0 or nwarnings<0:
+            print( ret)
+            raise WaqException("Failed to find error/warning count")
+
+    def cmd_delwaq2(self,output_filename=None):
+        """
+        Run delwaq2 (computation)
+        """
+        cmd=[self.delwaq2_path,self.name]
+        if not output_filename:
+            output_filename= os.path.join(self.base_path,'delwaq2.out')
+
+        t_start=time.time()
+        with open(output_filename,'wt') as fp_out:
+            self.log.info("Running delwaq2 - might take a while...")
+            self.log.info("  " + " ".join(cmd))
+            
+            sim_time=(self.stop_time-self.start_time) / np.timedelta64(1,'s')
+            tail=MonTail(os.path.join(self.base_path,self.name+".mon"),
+                         log=self.log,sim_time_seconds=sim_time)
+            try:
+                try:
+                    ret=subprocess.check_call(cmd,shell=False,cwd=self.base_path,stdout=fp_out,
+                                              stderr=subprocess.STDOUT)
+                except subprocess.CalledProcessError as exc:
+                    raise WaqException("delwaq2 exited with an error code - check %s"%output_filename)
+            finally:
+                tail.stop()
+
+        self.log.info("delwaq2 ran in %.2fs"%(time.time()-t_start))
+
+        # return value is not meaningful - have to scrape the output
+        with open(output_filename,'rt') as fp:
+            for line in fp:
+                if 'Stopping the program' in line:
+                    raise WaqException("Delwaq2 stopped early - check %s"%output_filename)
+        self.log.info("Done")
+            
+    # Paths for Delft tools:
+    @property
+    def delft_path(self):
+        # on linux probably one directory above bin directory
+        if 'DELFT_SRC' not in os.environ:
+            raise WaqException("Environment variable DELFT_SRC not defined")
+        return os.environ['DELFT_SRC']
+    @delft_path.setter
+    def delft_path(self,p):
+        os.environ['DELFT_SRC']=p
+    @property
+    def delft_bin(self):
+        if 'DELFT_BIN' in os.environ:
+            return os.environ['DELFT_BIN']
+        return os.path.join(self.delft_path,'bin')
+    @delft_bin.setter
+    def delft_bin(self,p):
+        os.environ['DELFT_BIN']=p
+    @property
+    def delwaq1_path(self):
+        return os.path.join(self.delft_bin,'delwaq1')
+    @property
+    def delwaq2_path(self):
+        return os.path.join(self.delft_bin,'delwaq2')
+
+    _share_path=None
+    @property
+    def share_path(self):
+        
+        if self._share_path is not None:
+            return self._share_path
+        elif 'DELFT_SHARE' in os.environ:
+            return os.environ['DELFT_SHARE']
+        else:
+            # this is where it would live for a freshly compiled, not installed
+            # delft3d:
+            return os.path.join(self.delft_path,'engines_gpl/waq/default')
+
+    @share_path.setter
+    def share_path(self,p):
+        self._share_path=p
+    @property
+    def bloom_path(self):
+        return os.path.join(self.share_path,'bloom.spe')
+    @property
+    def original_bloominp_path(self):
+        # this gets copied into the model run directory
+        return os.path.join(self.share_path,'bloominp.d09')
+    @property
+    def proc_path(self):
+        return os.path.join(self.share_path,'proc_def')
+
+    # plot process diagrams
+    def cmd_plot_process(self,run_name='dwaq'):
+        """ Build a process diagram and save to file.  Sorry, you have no voice 
+        in choosing the filename
+        """
+        pd = process_diagram.ProcDiagram(waq_dir=self.base_path)
+        pd.render_dot()
+    def cmd_view_process(self,run_name='dwaq'):
+        """ Build a process diagram and display
+        """
+        pd = process_diagram.ProcDiagram(waq_dir=self.base_path)
+        pd.view_dot()
+

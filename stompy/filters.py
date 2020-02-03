@@ -11,6 +11,7 @@ from scipy.signal.filter_design import butter
 import scipy.signal
 
 from scipy.signal import filtfilt, lfilter
+import warnings
 
 def lowpass(data,in_t=None,cutoff=None,order=4,dt=None,axis=-1,causal=False):
     """
@@ -21,9 +22,10 @@ def lowpass(data,in_t=None,cutoff=None,order=4,dt=None,axis=-1,causal=False):
     returns vector same as data, but with high frequencies removed
     """
     
-    # Step 1: Determine dt from data
-    dt=dt or np.median(np.diff(in_t))
-    dt=float(dt)
+    # Step 1: Determine dt from data or from user if specified
+    if dt is None:
+        dt=np.median(np.diff(in_t))
+    dt=float(dt) # make sure it's not an int
     cutoff=float(cutoff)
 
     Wn = dt / cutoff 
@@ -31,7 +33,11 @@ def lowpass(data,in_t=None,cutoff=None,order=4,dt=None,axis=-1,causal=False):
     B,A = butter(order, Wn)
 
     if not causal:
-        data_filtered = filtfilt(B,A,data,axis=axis)
+        # scipy filtfilt triggers some warning message about tuple
+        # indices.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            data_filtered = filtfilt(B,A,data,axis=axis)
     else:
         data_filtered = lfilter(B,A,data,axis=axis)
 
@@ -42,10 +48,23 @@ def lowpass_gotin(data,in_t_days,*args,**kwargs):
     print("Use lowpass_godin() instead of lowpass_gotin()")
     return lowpass_godin(data,in_t_days,*args,**kwargs)
 
-def lowpass_godin(data,in_t_days,*args,**kwargs):
+def lowpass_godin(data,in_t_days,ends='pass',*args,**kwargs):
     """ Approximate Gotin's tidal filter
     Note that in preserving the length of the dataset, the ends aren't really
     valid
+
+    data: array suitable to pass to np.convolve
+    in_t_days: timestamps in decimal days.  This is only used to establish
+    the time step, which is assumed to be constant.
+
+    ends:
+    'pass' no special treatment at the ends.  The first and last ~37
+      hours will be contaminated by end-effects.
+    'nan' will replace potentially contaminated end samples with nan
+
+    *args,**kwargs are allowed but ignored.  They are present to make it
+    easier to slip this method in to replace others without having to change
+    the call signature
     """
     mean_dt_h = 24*np.mean(np.diff(in_t_days))
 
@@ -57,12 +76,19 @@ def lowpass_godin(data,in_t_days,*args,**kwargs):
     A24 = np.ones(N24) / float(N24)
     A25 = np.ones(N25) / float(N25)
 
+    if ends=='nan':
+        # Add nan at start/end, which will carry through
+        # the convolution to mark any samples affected
+        # by the ends
+        data=np.concatenate( ( [np.nan],data,[np.nan] ) )
     data = np.convolve(data,A24,'same')
     data = np.convolve(data,A24,'same')
     data = np.convolve(data,A25,'same')
 
+    if ends=='nan':
+        data=data[1:-1]
+
     return data
-    
 
 def lowpass_fir(x,winsize,ignore_nan=True,axis=-1,mode='same',use_fft=False,
                 nan_weight_threshold=0.49):
@@ -99,7 +125,7 @@ def lowpass_fir(x,winsize,ignore_nan=True,axis=-1,mode='same',use_fft=False,
 
     slices=[None]*x.ndim
     slices[axis]=slice(None)
-    win=win[slices] # expand to get the right broadcasting
+    win=win[tuple(slices)] # expand to get the right broadcasting
 
     if ignore_nan:
         x=x.copy()
@@ -115,3 +141,23 @@ def lowpass_fir(x,winsize,ignore_nan=True,axis=-1,mode='same',use_fft=False,
         result[~has_weight]=0 # redundant, but in case of roundoff.
         result[weights<nan_weight_threshold]=np.nan
     return result
+
+# xarray time series versions:
+def lowpass_xr(da,cutoff,**kw):
+    """
+    Like lowpass(), but ds is a data array with a time coordinate,
+    and cutoff is a timedelta64.
+    """
+    data=da.values
+    time_secs=(da.time.values-da.time.values[0])/np.timedelta64(1,'s')
+    cutoff_secs=cutoff/np.timedelta64(1,'s')
+
+    axis=da.get_axis_num('time')
+    
+    data_lp=lowpass(data,time_secs,cutoff_secs,axis=axis,**kw)
+    da_lp=da.copy(deep=True)
+    da_lp.values[:]=data_lp
+    da_lp.attrs['comment']="lowpass at %g seconds"%(cutoff_secs)
+    return da_lp
+
+    

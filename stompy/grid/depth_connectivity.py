@@ -18,7 +18,10 @@ see end of file
 from __future__ import print_function
 
 import numpy as np
+import pdb
 from scipy.ndimage import label
+
+from .. import utils
 
 if 1:
     debug=0
@@ -41,16 +44,16 @@ except ImportError:
 def greedy_edgemin_to_node(g,orig_node_depth,edge_min_depth):
     """
     A simple approach to moving edge depths to nodes, when the
-    hydro model (i.e. DFM) will use the minimum of the nodes to 
+    hydro model (i.e. DFM) will use the minimum of the nodes to
     set the edge.
-    It sounds roundabout because it is, but there is not a 
+    It sounds roundabout because it is, but there is not a
     supported way to assign edge depth directly.
 
     For each edge, want to enforce a minimum depth in two sense:
     1. one of its nodes is at the minimum depth
     2. neither of the nodes are below the minimum depth
     and..
-    3. the average of the two nodes is close to the average DEM depth 
+    3. the average of the two nodes is close to the average DEM depth
        of the edge
     Not yet sure of how to get all of those.  This method focuses on
     the first point, but in some situations that is still problematic.
@@ -70,7 +73,7 @@ def greedy_edgemin_to_node(g,orig_node_depth,edge_min_depth):
     for j in edge_min_ordering:
         if np.isnan(edge_min_depth[j]):
             break # done with all of the target depths
-        
+
         nodes=g.edges['nodes'][j]
 
         # is this edge is already low enough, based on minimum of
@@ -102,6 +105,88 @@ def greedy_edgemin_to_node(g,orig_node_depth,edge_min_depth):
 
     missing=np.isnan(conn_depth)
     conn_depth[missing]=orig_node_depth[missing]
+    return conn_depth
+
+
+def greedy_edge_mean_to_node(g,orig_node_depth=None,edge_depth=None,n_iter=100):
+    """
+    Return node depths such that the mean of the node depths on each
+    edge approximate the provided edge_mean_depth.
+    The approach is iterative, starting with the largest errors, visiting
+    each edge a max of once.
+
+    Still in development, has not been tested.
+    """
+    from scipy.optimize import fmin
+
+    if edge_depth is None:
+        if 'depth' in g.edges.dtype.names:
+            edge_depth=g.edges['depth']
+
+    assert edge_depth is not None
+
+    if orig_node_depth is None:
+        if 'depth' in g.nodes.dtype.names:
+            orig_node_depth=g.nodes['depth']
+        else:
+            # Rough starting guess:
+            orig_node_depth=np.zeros( g.Nnodes(), 'f8')
+            for n in range(g.Nnodes()):
+                orig_node_depth[n] = edge_depth[g.node_to_edges(n)].mean()
+
+    # The one we'll be updating:
+    conn_depth=orig_node_depth.copy()
+
+    node_mean=conn_depth[g.edges['nodes']].mean(axis=1)
+    errors=node_mean - edge_depth
+    errors[ np.isnan(errors) ] = 0.0
+    
+    potential=np.ones(g.Nedges())
+
+    for loop in range(n_iter):
+        verbose= (loop%100==0)
+
+        # Find an offender
+        j_bad=np.argmax(potential*errors)
+        if potential[j_bad]==0:
+            print("DONE")
+            break
+
+        potential[j_bad]=0 # only visit each edge once.
+
+        # Get the neighborhood of nodes:
+        # nodes=
+        jj_nbrs=np.concatenate( [ g.node_to_edges(n)
+                                  for n in g.edges['nodes'][j_bad] ] )
+        jj_nbrs=np.unique(jj_nbrs)
+        jj_nbrs = jj_nbrs[ np.isfinite(edge_depth[jj_nbrs]) ]
+
+        n_bad=g.edges['nodes'][j_bad]
+
+        def cost(ds):
+            # Cost function over the two depths of the ends of j_bad:
+            conn_depth[n_bad]=ds
+            new_errors=conn_depth[g.edges['nodes'][jj_nbrs]].mean(axis=1) - edge_depth[jj_nbrs]
+            # weight high edges 10x more than low edges:
+            cost=new_errors.clip(0,np.inf).sum() - 0.5 * new_errors.clip(-np.inf,0).sum()
+            return cost
+        ds0=conn_depth[n_bad]
+        cost0=cost(ds0)
+
+        ds=fmin(cost,ds0,disp=False)
+        costn=cost(ds)
+        conn_depth[n_bad]=ds
+
+        if verbose:
+            print("Loop %d: %d/%d edges  starting error: j=%d => %.4f"%(loop,potential.sum(),len(potential),
+                                                                        j_bad,errors[j_bad]))
+
+        node_mean=conn_depth[g.edges['nodes']].mean(axis=1)
+        errors=node_mean - edge_depth
+        errors[ np.isnan(errors) ] = 0.0
+
+        if verbose:
+            print("    ending error: j=%d => %.4f"%(j_bad,errors[j_bad]))
     return conn_depth
 
     
@@ -165,8 +250,8 @@ def min_graph_elevation_for_edge(g,dem,j,starts='lowest'):
     # asserts/assumes that the extents are multiples of dx,dy.
     dx=dem.dx ; dy=dem.dy
     dxy=np.array([dx,dy])
-    assert dem.extents[0] % dem.dx == 0
-    assert dem.extents[2] % dem.dy == 0
+    #assert dem.extents[0] % dem.dx == 0
+    #assert dem.extents[2] % dem.dy == 0
 
     # protects from roundoff cases
     pad=1
@@ -178,6 +263,11 @@ def min_graph_elevation_for_edge(g,dem,j,starts='lowest'):
     # tile = dem.extract_tile(xxyy)
     tile=dem.crop(xxyy)
 
+    # Some of the above is for precise usage of SimpleGrid.
+    # but in some cases we're dealing with a MultiRasterField, and the
+    # local resolution is coarser:
+    dx=tile.dx ; dy=tile.dy
+    
     if tile is None:
         return np.nan
 
@@ -318,4 +408,59 @@ def edge_connection_depth(g,dem,edge_mask=None,centers='circumcenter'):
 
     return edge_elevations
 
+    
+def poly_mean_elevation(dem,pnts):
+    # asserts/assumes that the extents are multiples of dx,dy.
+    dx=dem.dx ; dy=dem.dy
+    dxy=np.array([dx,dy])
+    
+    # protects from roundoff cases
+    pad=1
+    ll = np.floor(pnts.min(axis=0) / dxy - pad) * dxy
+    ur = np.ceil(pnts.max(axis=0) / dxy + pad) * dxy
+    xxyy = [ll[0],ur[0],ll[1],ur[1]]
 
+    # crop first - much faster
+    tile=dem.crop(xxyy)
+
+    # Some of the above is for precise usage of SimpleGrid.
+    # but in some cases we're dealing with a MultiRasterField, and the
+    # local resolution is coarser:
+    dx=tile.dx ; dy=tile.dy
+    
+    if tile is None:
+        return np.nan
+
+    # if the tile is not fully populated, also give up
+    if ( (tile.extents[0]>xxyy[0]) or
+         (tile.extents[1]<xxyy[1]) or
+         (tile.extents[2]>xxyy[2]) or
+         (tile.extents[3]<xxyy[3]) ):
+        print("Tile clipped by edge of DEM")
+        return np.nan
+
+    tile_origin = np.array( [ tile.extents[0], tile.extents[2]] )
+    tile_dxy = np.array( [tile.dx,tile.dy] )
+
+    def xy_to_ij(xy):
+        return (( xy - tile_origin ) / tile_dxy).astype(np.int32)
+
+    hull_ijs = xy_to_ij(pnts)
+
+    # blank out the dem outside the two cells
+    ny, nx = tile.F.shape
+    valid = points_to_mask(hull_ijs,nx,ny)
+    return tile.F[valid].mean()
+    
+
+def cell_mean_depth(g,dem):
+    """
+    Calculate "true" mean depth for each cell, at the resolution of
+    the DEM.  This does not split pixels, though.
+    """
+    cell_z_bed=np.nan*np.ones(g.Ncells())
+    
+    for c in utils.progress(range(g.Ncells())):
+        cell_z_bed[c]=poly_mean_elevation(dem, g.nodes['x'][ g.cell_to_nodes(c) ])
+        
+    return cell_z_bed

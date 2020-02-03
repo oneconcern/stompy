@@ -83,7 +83,7 @@ class Diffuser(object):
         """ pre-calculate geometric quantities related to the grid
         for use in the discretization
         """
-        self.vc = self.grid.cells_center()
+        self.vc = self.grid.cells_center() # circumcenters
         self.ec = self.grid.edges_center()
         
         self.c1 = self.grid.edges['cells'][:,0]
@@ -281,6 +281,11 @@ class Diffuser(object):
         #return np.random.random(self.Ncalc)
         return (np.arange(self.Ncalc) % 10.0) / 10.0
 
+    def compute(self):
+        self.construct_linear_system()
+        self.solve_linear_system()
+        return self.C_solved
+        
     solve_method='direct'
     solve_tol=1e-6
     def solve_linear_system(self,animate=False):
